@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.0
+
+- Rename the package and user-facing product to Agent Session Index.
+- Add a source adapter boundary and local Codex rollout support.
+- Migrate existing Claude-only databases to source-qualified identities.
+- Add source labels and filters to search, context, recent, find, analytics,
+  tools, topics, stats, and indexing commands.
+- Exclude developer/system instructions, reasoning records, tool outputs, and
+  large encoded payloads from FTS.
+- Keep all indexing and synthesis workflows local; transcript uploads are
+  disabled.
+
 ## v0.3.1 — Stop titling everything "## Curation Data"
 
 - **Smarter title auto-generation** — skips markdown headers, agent system prompts, and system caveats when picking a title from user messages. Tries up to 5 messages before giving up.

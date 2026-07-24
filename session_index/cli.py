@@ -1,363 +1,348 @@
 #!/usr/bin/env python3
-"""
-Unified CLI for claude-session-index.
+"""Unified local CLI for Agent Session Index."""
 
-Plain text defaults to search — no subcommands needed for the common case.
-
-Usage:
-    sessions "webhook debugging"                # search (default)
-    sessions "webhook" --context                # search with conversation excerpts
-    sessions context a5b111c6 "failure"         # conversation around matches
-    sessions context a5b111c6                   # all exchanges
-    sessions analytics --week                   # this week's stats
-    sessions analytics --client "Acme"          # per-client stats
-    sessions synthesize "form automation"       # cross-session synthesis
-    sessions recent                             # last 10 sessions
-    sessions recent 20                          # last 20 sessions
-    sessions find --tool Task --week            # filter sessions
-    sessions tools                              # top tools across sessions
-    sessions tools "Bash"                       # sessions using specific tool
-    sessions topics <session_id>                # topic timeline
-    sessions stats                              # database overview
-    sessions index                              # re-index new/modified
-    sessions index --backfill                   # re-index everything
-"""
+from __future__ import annotations
 
 import sys
-import json
+from datetime import datetime
 from pathlib import Path
-from datetime import datetime, timedelta
 
 try:
     from . import config
-    from .search import SessionSearch, format_result
     from .analyzer import (
-        get_context, format_context,
-        analytics, format_analytics,
-        synthesize, format_synthesis,
+        analytics,
+        format_analytics,
+        format_context,
+        format_synthesis,
+        get_context,
+        synthesize,
     )
+    from .search import SessionSearch, format_result
 except ImportError:
     import config
-    from search import SessionSearch, format_result
     from analyzer import (
-        get_context, format_context,
-        analytics, format_analytics,
-        synthesize, format_synthesis,
+        analytics,
+        format_analytics,
+        format_context,
+        format_synthesis,
+        get_context,
+        synthesize,
+    )
+    from search import SessionSearch, format_result
+
+SOURCES = ("claude", "codex")
+SUBCOMMANDS = {
+    "context", "analytics", "synthesize", "recent", "find",
+    "tools", "topics", "stats", "index", "search",
+}
+
+
+def _add_source(parser):
+    parser.add_argument(
+        "--source", choices=SOURCES,
+        help="Limit the command to one transcript source",
     )
 
 
-SUBCOMMANDS = {
-    'context', 'analytics', 'synthesize', 'recent', 'find',
-    'tools', 'topics', 'stats', 'index', 'search',
-}
+def _print_inline_context(result: dict, query: str, db_path: Path):
+    context = get_context(
+        result["session_id"], query=query, limit=3, db_path=db_path,
+        source=result["source"],
+    )
+    for exchange in context.get("exchanges", []):
+        timestamp = exchange["timestamp"][:16] if exchange["timestamp"] else ""
+        try:
+            display = datetime.fromisoformat(timestamp).strftime("%b %d, %H:%M")
+        except (ValueError, TypeError):
+            display = timestamp
+        print(f"    ┌─ {display} {'─' * max(1, 36 - len(display))}")
+        user = exchange["user"][:250].replace("\n", " ")
+        assistant = exchange["assistant"][:250].replace("\n", " ")
+        print(f"    │ 🧑 {user}")
+        print(f"    │ 🤖 {assistant}")
+        print(f"    └{'─' * 42}")
+
+
+def _print_results(title: str, results: list[dict]):
+    print(f"\n{title}\n")
+    for result in results:
+        print(format_result(result))
+        print()
 
 
 def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        prog='sessions',
-        description='Search and analyze your Claude Code sessions',
+        prog="sessions",
+        description="Search and analyze local Claude and Codex sessions",
         usage='sessions "query" | sessions <command> [options]',
     )
-    parser.add_argument('--db-path', type=str, default=None,
-                        help='Path to sessions.db (overrides config)')
+    parser.add_argument(
+        "--db-path", type=str, default=None,
+        help="Path to sessions.db (overrides config)",
+    )
+    subparsers = parser.add_subparsers(dest="command")
 
-    subparsers = parser.add_subparsers(dest='command')
+    command = subparsers.add_parser("search", help="Full-text search")
+    command.add_argument("query")
+    command.add_argument("-n", "--limit", type=int, default=20)
+    command.add_argument("--context", action="store_true")
+    _add_source(command)
 
-    # search (also the default when no subcommand given)
-    sp = subparsers.add_parser('search', help='Full-text search')
-    sp.add_argument('query', help='Search query')
-    sp.add_argument('-n', '--limit', type=int, default=20)
-    sp.add_argument('--context', action='store_true',
-                    help='Show conversation exchanges inline')
+    command = subparsers.add_parser("context", help="Conversation context")
+    command.add_argument("session_id", help="Session ID, prefix, or source:id")
+    command.add_argument("query", nargs="?", default=None)
+    command.add_argument("-n", "--limit", type=int, default=10)
+    _add_source(command)
 
-    # context
-    sp = subparsers.add_parser('context', help='Conversation context for a session')
-    sp.add_argument('session_id', help='Session ID (full or prefix)')
-    sp.add_argument('query', nargs='?', default=None, help='Filter to matching exchanges')
-    sp.add_argument('-n', '--limit', type=int, default=10, help='Max exchanges')
+    command = subparsers.add_parser("analytics", help="Session analytics")
+    command.add_argument("--client")
+    command.add_argument("--project")
+    command.add_argument("--week", action="store_true")
+    command.add_argument("--month", action="store_true")
+    _add_source(command)
 
-    # analytics
-    sp = subparsers.add_parser('analytics', help='Session analytics')
-    sp.add_argument('--client', help='Filter by client')
-    sp.add_argument('--project', help='Filter by project')
-    sp.add_argument('--week', action='store_true', help='This week only')
-    sp.add_argument('--month', action='store_true', help='This month only')
+    command = subparsers.add_parser(
+        "synthesize",
+        help="Explain local-only synthesis (no transcript uploads)",
+    )
+    command.add_argument("query")
+    command.add_argument("--limit", type=int, default=10)
 
-    # synthesize
-    sp = subparsers.add_parser('synthesize', help='Cross-session synthesis')
-    sp.add_argument('query', help='Topic to synthesize across sessions')
-    sp.add_argument('--limit', type=int, default=10, help='Max sessions to analyze')
+    command = subparsers.add_parser("recent", help="Recent sessions")
+    command.add_argument("n", nargs="?", type=int, default=10)
+    _add_source(command)
 
-    # recent
-    sp = subparsers.add_parser('recent', help='Recent sessions')
-    sp.add_argument('n', nargs='?', type=int, default=10)
+    command = subparsers.add_parser("find", help="Filter sessions")
+    command.add_argument("--client")
+    command.add_argument("--tag")
+    command.add_argument("--tool")
+    command.add_argument("--agent")
+    command.add_argument("--date")
+    command.add_argument("--week", action="store_true")
+    command.add_argument("--days", type=int)
+    command.add_argument("--project")
+    command.add_argument("--exclude-project")
+    command.add_argument("--compacted", action="store_true")
+    command.add_argument("-n", "--limit", type=int, default=20)
+    _add_source(command)
 
-    # find
-    sp = subparsers.add_parser('find', help='Filter sessions')
-    sp.add_argument('--client', help='Filter by client')
-    sp.add_argument('--tag', help='Filter by tag')
-    sp.add_argument('--tool', help='Filter by tool used')
-    sp.add_argument('--agent', help='Filter by agent used')
-    sp.add_argument('--date', help='Filter by date (YYYY-MM-DD)')
-    sp.add_argument('--week', action='store_true', help='Last 7 days')
-    sp.add_argument('--days', type=int, help='Last N days')
-    sp.add_argument('--project', help='Filter by project')
-    sp.add_argument('--exclude-project', help='Exclude a project from results')
-    sp.add_argument('--compacted', action='store_true', help='Only compacted sessions')
-    sp.add_argument('-n', '--limit', type=int, default=20)
+    command = subparsers.add_parser("tools", help="Tool usage")
+    command.add_argument("tool_name", nargs="?")
+    _add_source(command)
 
-    # tools
-    sp = subparsers.add_parser('tools', help='Tool usage')
-    sp.add_argument('tool_name', nargs='?', help='Specific tool')
+    command = subparsers.add_parser("topics", help="Topic timeline")
+    command.add_argument("session_id")
+    _add_source(command)
 
-    # topics
-    sp = subparsers.add_parser('topics', help='Topic timeline for a session')
-    sp.add_argument('session_id', help='Session ID (full or prefix)')
+    command = subparsers.add_parser("stats", help="Database overview")
+    _add_source(command)
 
-    # stats
-    subparsers.add_parser('stats', help='Database overview')
+    command = subparsers.add_parser("index", help="Index local sessions")
+    command.add_argument("--backfill", action="store_true")
+    command.add_argument("--session", metavar="ID")
+    command.add_argument("--claude-root", metavar="PATH")
+    command.add_argument("--codex-root", metavar="PATH")
+    _add_source(command)
 
-    # index
-    sp = subparsers.add_parser('index', help='Index sessions')
-    sp.add_argument('--backfill', action='store_true', help='Re-index everything')
-    sp.add_argument('--session', metavar='ID', help='Index a single session')
-
-    # --- Default to search if first arg isn't a subcommand ---
-    # Intercept before argparse: if the first real arg isn't a known
-    # subcommand or flag, treat the whole thing as a search query.
     raw_args = sys.argv[1:]
-    if raw_args and raw_args[0] not in SUBCOMMANDS and not raw_args[0].startswith('-'):
-        # Bare text = search. Rebuild as: search "the query" [flags]
-        # Once we hit a flag (starts with -), everything after is flags/values.
+    if (
+        raw_args
+        and raw_args[0] not in SUBCOMMANDS
+        and not raw_args[0].startswith("-")
+    ):
         query_parts = []
         flags = []
         in_flags = False
-        for arg in raw_args:
-            if arg.startswith('-'):
+        for argument in raw_args:
+            if argument.startswith("-"):
                 in_flags = True
-            if in_flags:
-                flags.append(arg)
-            else:
-                query_parts.append(arg)
-        sys.argv = [sys.argv[0], 'search', ' '.join(query_parts)] + flags
+            (flags if in_flags else query_parts).append(argument)
+        sys.argv = [
+            sys.argv[0], "search", " ".join(query_parts), *flags
+        ]
 
     args = parser.parse_args()
-
     if args.command is None:
         parser.print_help()
-        sys.exit(0)
+        return
 
-    # Resolve paths
-    db_path = Path(args.db_path) if args.db_path else config.get_db_path()
+    db_path = (
+        Path(args.db_path).expanduser()
+        if args.db_path else config.get_db_path()
+    )
+    if args.command == "index":
+        try:
+            from .indexer import SessionIndexer
+        except ImportError:
+            from indexer import SessionIndexer
+        indexer = SessionIndexer(
+            db_path=db_path,
+            projects_dir=Path(args.claude_root).expanduser()
+            if args.claude_root else None,
+            codex_sessions_dir=Path(args.codex_root).expanduser()
+            if args.codex_root else None,
+        )
+        indexer.connect()
+        try:
+            if args.backfill:
+                indexer.backfill_all(source=args.source)
+            elif args.session:
+                if not indexer.index_session(
+                    session_id=args.session, source=args.source
+                ):
+                    raise SystemExit(1)
+            else:
+                stats = indexer.index_incremental(source=args.source)
+                print(
+                    f"Incremental: {stats['indexed']} new/updated, "
+                    f"{stats['unchanged']} unchanged, "
+                    f"{stats['errors']} errors"
+                )
+        finally:
+            indexer.close()
+        return
+
     config.ensure_indexed(db_path)
 
-    # --- Dispatch ---
+    if args.command == "context":
+        print(format_context(get_context(
+            args.session_id, query=args.query, limit=args.limit,
+            db_path=db_path, source=args.source,
+        )))
+        return
 
-    if args.command == 'search':
-        searcher = SessionSearch(db_path=db_path)
-        searcher.connect()
-        try:
-            results = searcher.search(args.query, args.limit)
+    if args.command == "analytics":
+        print(format_analytics(analytics(
+            client=args.client, project=args.project,
+            week=args.week, month=args.month,
+            db_path=db_path, source=args.source,
+        )))
+        return
+
+    if args.command == "synthesize":
+        print(format_synthesis(synthesize(
+            args.query, limit=args.limit, db_path=db_path
+        )))
+        return
+
+    searcher = SessionSearch(db_path)
+    searcher.connect()
+    try:
+        if args.command == "search":
+            results = searcher.search(
+                args.query, limit=args.limit, source=args.source
+            )
             if not results:
                 print(f"No results for: {args.query}")
                 return
-            print(f"\n🔍 {len(results)} results for \"{args.query}\"\n")
-            for r in results:
-                print(format_result(r))
+            print(f'\n🔍 {len(results)} results for "{args.query}"\n')
+            for result in results:
+                print(format_result(result))
                 if args.context:
-                    ctx = get_context(r['session_id'], query=args.query, limit=3, db_path=db_path)
-                    if ctx.get('exchanges'):
-                        for ex in ctx['exchanges']:
-                            ts = ex['timestamp'][:16] if ex['timestamp'] else ''
-                            try:
-                                dt = datetime.fromisoformat(ts)
-                                ts_display = dt.strftime("%b %d, %H:%M")
-                            except (ValueError, TypeError):
-                                ts_display = ts
-                            print(f"    ┌─ {ts_display} {'─' * max(1, 36 - len(ts_display))}")
-                            user_preview = ex['user'][:250].replace('\n', ' ')
-                            asst_preview = ex['assistant'][:250].replace('\n', ' ')
-                            print(f"    │ 🧑 {user_preview}")
-                            print(f"    │ 🤖 {asst_preview}")
-                            print(f"    └{'─' * 42}")
+                    _print_inline_context(result, args.query, db_path)
                 print()
-        finally:
-            searcher.close()
 
-    elif args.command == 'context':
-        result = get_context(args.session_id, query=args.query,
-                             limit=args.limit, db_path=db_path)
-        print(format_context(result))
+        elif args.command == "recent":
+            results = searcher.recent(args.n, source=args.source)
+            _print_results(f"📋 Last {len(results)} sessions", results)
 
-    elif args.command == 'analytics':
-        result = analytics(
-            client=args.client, project=args.project,
-            week=args.week, month=args.month,
-            db_path=db_path,
-        )
-        print(format_analytics(result))
-
-    elif args.command == 'synthesize':
-        result = synthesize(args.query, limit=args.limit, db_path=db_path)
-        print(format_synthesis(result))
-
-    elif args.command == 'recent':
-        searcher = SessionSearch(db_path=db_path)
-        searcher.connect()
-        try:
-            results = searcher.recent(args.n)
-            print(f"\n📋 Last {len(results)} sessions\n")
-            for r in results:
-                print(format_result(r))
-                print()
-        finally:
-            searcher.close()
-
-    elif args.command == 'find':
-        searcher = SessionSearch(db_path=db_path)
-        searcher.connect()
-        try:
+        elif args.command == "find":
             results = searcher.find(
                 client=args.client, tag=args.tag, tool=args.tool,
                 agent=args.agent, date=args.date, week=args.week,
-                days=getattr(args, 'days', None),
-                project=args.project,
-                exclude_project=getattr(args, 'exclude_project', None),
+                days=args.days, project=args.project,
+                exclude_project=args.exclude_project,
                 has_compaction=True if args.compacted else None,
-                limit=args.limit,
+                limit=args.limit, source=args.source,
             )
             if not results:
                 print("No sessions match those filters.")
                 return
-            print(f"\n📋 {len(results)} sessions\n")
-            for r in results:
-                print(format_result(r))
-                print()
-        finally:
-            searcher.close()
+            _print_results(f"📋 {len(results)} sessions", results)
 
-    elif args.command == 'tools':
-        searcher = SessionSearch(db_path=db_path)
-        searcher.connect()
-        try:
-            tool_name = getattr(args, 'tool_name', None)
-            results = searcher.tools_usage(tool_name)
-            if tool_name:
-                print(f"\n🔧 Sessions using '{tool_name}'\n")
-                for r in results:
-                    sid = r['session_id'][:8]
-                    title = r.get('title_display') or r.get('title') or '(unnamed)'
-                    print(f"  ◆ {sid} · {r['tool_name']} ×{r['use_count']}  {title}")
+        elif args.command == "tools":
+            results = searcher.tools_usage(
+                args.tool_name, source=args.source
+            )
+            label = args.source or "all sources"
+            if args.tool_name:
+                print(f"\n🔧 [{label}] sessions using '{args.tool_name}'\n")
+                for result in results:
+                    title = (
+                        result.get("title_display")
+                        or result.get("title")
+                        or "(unnamed)"
+                    )
+                    print(
+                        f"  ◆ [{result['source']}] "
+                        f"{result['session_id'][:8]} · "
+                        f"{result['tool_name']} ×{result['use_count']}  {title}"
+                    )
             else:
-                print(f"\n🔧 Top tools across all sessions\n")
-                for r in results:
-                    print(f"  {r['tool_name']:25s}  {r['total']:>6d} uses  ({r['session_count']} sessions)")
-        finally:
-            searcher.close()
+                print(f"\n🔧 Top tools — {label}\n")
+                for result in results:
+                    print(
+                        f"  {result['tool_name']:25s} "
+                        f"{result['total']:>6d} uses "
+                        f"({result['session_count']} sessions)"
+                    )
 
-    elif args.command == 'topics':
-        searcher = SessionSearch(db_path=db_path)
-        searcher.connect()
-        try:
-            sid = args.session_id
-            if len(sid) < 36:
-                row = searcher.conn.execute(
-                    "SELECT session_id FROM sessions WHERE session_id LIKE ?", (f"{sid}%",)
-                ).fetchone()
-                if row:
-                    sid = row['session_id']
-                else:
-                    print(f"No session found matching: {sid}")
-                    return
-
-            topics = searcher.topics(sid)
-            if not topics:
-                print(f"No topics recorded for session {sid[:8]}")
+        elif args.command == "topics":
+            session = searcher.resolve_session(
+                args.session_id, args.source
+            )
+            if not session:
+                print(
+                    "No unique session found. Use a longer ID or --source."
+                )
                 return
+            topics = searcher.topics(
+                session["session_id"], session["source"]
+            )
+            if not topics:
+                print(
+                    f"No topics recorded for "
+                    f"{session['source']}:{session['session_id'][:8]}"
+                )
+                return
+            print(
+                f"\n💬 [{session['source']}] topic timeline "
+                f"({len(topics)} entries)\n"
+            )
+            for topic in topics:
+                timestamp = (
+                    topic["captured_at"][:16] if topic["captured_at"] else ""
+                )
+                exchange = (
+                    f" (exchange {topic['exchange_number']})"
+                    if topic["exchange_number"] else ""
+                )
+                print(f"  [{topic['source']:20s}] {timestamp}{exchange}")
+                print(f"                       {topic['topic']}\n")
 
-            session = searcher.conn.execute(
-                "SELECT title_display, start_time, project_name FROM sessions WHERE session_id=?",
-                (sid,)
-            ).fetchone()
-
-            if session:
-                title = session['title_display'] or '(unnamed)'
-                print(f"\n╭─── {title} {'─' * max(1, 44 - len(title))}")
-                meta = []
-                if session['start_time']:
-                    meta.append(session['start_time'][:16])
-                if session['project_name']:
-                    meta.append(session['project_name'])
-                print(f"│ {' · '.join(meta)}")
-                print(f"╰{'─' * 48}")
-
-            print(f"\n💬 Topic timeline ({len(topics)} entries)\n")
-            for t in topics:
-                ts = t['captured_at'][:16] if t['captured_at'] else ''
-                ex = f" (exchange {t['exchange_number']})" if t['exchange_number'] else ''
-                src = t['source']
-                print(f"  [{src:20s}] {ts}{ex}")
-                print(f"                       {t['topic']}")
-                print()
-        finally:
-            searcher.close()
-
-    elif args.command == 'stats':
-        searcher = SessionSearch(db_path=db_path)
-        searcher.connect()
-        try:
-            stats = searcher.stats()
-            print(f"\n📊 Database overview")
-            print(f"{'═' * 40}")
+        elif args.command == "stats":
+            stats = searcher.stats(args.source)
+            print("\n📊 Database overview")
+            print("═" * 40)
+            print(f"  Source:    {args.source or 'all'}")
             print(f"  Sessions:  {stats.get('total_sessions', 0)}")
             print(f"  Topics:    {stats.get('total_topics', 0)}")
             print(f"  Tools:     {stats.get('total_tools', 0)} distinct")
             print(f"  Agents:    {stats.get('total_agents', 0)} distinct")
-            dr = stats.get('date_range', {})
-            if dr.get('earliest'):
-                print(f"  Range:     {dr['earliest']} → {dr['latest']}")
-            if stats.get('by_project'):
-                print(f"\n  📁 By project")
-                print(f"  {'─' * 36}")
-                for name, cnt in list(stats['by_project'].items())[:10]:
-                    print(f"  {name:25s}  {cnt:>5d}")
-            if stats.get('top_tools'):
-                print(f"\n  🔧 Top tools")
-                print(f"  {'─' * 36}")
-                for name, cnt in list(stats['top_tools'].items())[:10]:
-                    print(f"  {name:25s}  {cnt:>5d}")
-            print()
-        finally:
-            searcher.close()
-
-    elif args.command == 'index':
-        try:
-            from session_index.indexer import SessionIndexer
-        except ImportError:
-            try:
-                from .indexer import SessionIndexer
-            except ImportError:
-                from indexer import SessionIndexer
-
-        indexer = SessionIndexer(db_path=db_path)
-        indexer.connect()
-        try:
-            if args.backfill:
-                indexer.backfill_all()
-            elif args.session:
-                if indexer.index_session(session_id=args.session):
-                    print(f"Indexed: {args.session}")
-                else:
-                    print(f"Failed to index: {args.session}", file=sys.stderr)
-                    sys.exit(1)
-            else:
-                stats = indexer.index_incremental()
-                print(f"Incremental: {stats['indexed']} new/updated, "
-                      f"{stats['unchanged']} unchanged, {stats['errors']} errors")
-        finally:
-            indexer.close()
+            if stats.get("by_source"):
+                print("\n  By source")
+                for source, count in stats["by_source"].items():
+                    print(f"  {source:25s}  {count:>5d}")
+            date_range = stats.get("date_range", {})
+            if date_range.get("earliest"):
+                print(
+                    f"  Range:     {date_range['earliest']} → "
+                    f"{date_range['latest']}"
+                )
+    finally:
+        searcher.close()
 
 
 if __name__ == "__main__":

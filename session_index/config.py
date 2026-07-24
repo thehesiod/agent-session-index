@@ -1,4 +1,4 @@
-"""Configuration resolution for claude-session-index.
+"""Configuration resolution for Agent Session Index.
 
 Priority order:
 1. Function arguments (passed directly)
@@ -18,6 +18,16 @@ DEFAULTS = {
     "topics_dir": str(Path.home() / ".claude" / "session-topics"),
     "clients": [],
     "project_names": {},
+    "sources": {
+        "claude": {
+            "enabled": True,
+            "root": str(Path.home() / ".claude" / "projects"),
+        },
+        "codex": {
+            "enabled": True,
+            "root": str(Path.home() / ".codex" / "sessions"),
+        },
+    },
 }
 
 CONFIG_FILE = Path.home() / ".session-index" / "config.json"
@@ -41,14 +51,35 @@ def get_config() -> dict:
     if _cached_config is not None:
         return _cached_config
 
-    # Start with defaults
-    config = dict(DEFAULTS)
+    # Start with defaults (copy nested source dictionaries too).
+    config = {
+        **DEFAULTS,
+        "sources": {
+            name: dict(settings)
+            for name, settings in DEFAULTS["sources"].items()
+        },
+    }
 
     # Layer on config file
     file_config = _load_config_file()
     for key, value in file_config.items():
-        if key in config and value is not None:
+        if key == "sources" and isinstance(value, dict):
+            for source, settings in value.items():
+                if source in config["sources"] and isinstance(settings, dict):
+                    config["sources"][source].update(
+                        {k: v for k, v in settings.items() if v is not None}
+                    )
+        elif key in config and value is not None:
             config[key] = value
+
+    # Existing configs used projects_dir for Claude. Keep it authoritative
+    # unless the new nested Claude root was explicitly configured.
+    if "projects_dir" in file_config and not (
+        isinstance(file_config.get("sources"), dict)
+        and "claude" in file_config["sources"]
+        and "root" in file_config["sources"]["claude"]
+    ):
+        config["sources"]["claude"]["root"] = file_config["projects_dir"]
 
     # Layer on environment variables
     env_map = {
@@ -61,15 +92,74 @@ def get_config() -> dict:
         if val:
             config[config_key] = val
 
+    if os.environ.get("SESSION_INDEX_PROJECTS"):
+        config["sources"]["claude"]["root"] = os.environ["SESSION_INDEX_PROJECTS"]
+
+    source_root_env = {
+        "SESSION_INDEX_CLAUDE_ROOT": "claude",
+        "SESSION_INDEX_CODEX_ROOT": "codex",
+    }
+    for env_key, source in source_root_env.items():
+        if os.environ.get(env_key):
+            config["sources"][source]["root"] = os.environ[env_key]
+
+    enabled_sources = os.environ.get("SESSION_INDEX_SOURCES")
+    if enabled_sources is not None:
+        enabled = {
+            item.strip().lower()
+            for item in enabled_sources.split(",")
+            if item.strip()
+        }
+        for source in config["sources"]:
+            config["sources"][source]["enabled"] = source in enabled
+
+    for source in ("claude", "codex"):
+        value = os.environ.get(f"SESSION_INDEX_{source.upper()}_ENABLED")
+        if value is not None:
+            config["sources"][source]["enabled"] = (
+                value.strip().lower() not in {"0", "false", "no", "off"}
+            )
+
     _cached_config = config
     return config
 
 
 def get_projects_dir(override: str = None) -> Path:
-    """Get projects directory path."""
+    """Get the Claude projects directory (backwards-compatible helper)."""
     if override:
         return Path(override).expanduser()
-    return Path(get_config()["projects_dir"]).expanduser()
+    return Path(get_config()["sources"]["claude"]["root"]).expanduser()
+
+
+def get_codex_sessions_dir(override: str = None) -> Path:
+    """Get the Codex rollout sessions directory."""
+    if override:
+        return Path(override).expanduser()
+    return Path(get_config()["sources"]["codex"]["root"]).expanduser()
+
+
+def get_source_configs(overrides: dict | None = None) -> dict:
+    """Return source enablement and roots, with optional runtime overrides."""
+    resolved = {
+        source: {
+            "enabled": bool(settings.get("enabled", True)),
+            "root": str(Path(settings["root"]).expanduser()),
+        }
+        for source, settings in get_config()["sources"].items()
+    }
+    for source, settings in (overrides or {}).items():
+        if source not in resolved:
+            continue
+        if isinstance(settings, (str, Path)):
+            resolved[source]["root"] = str(Path(settings).expanduser())
+        elif isinstance(settings, dict):
+            if "enabled" in settings:
+                resolved[source]["enabled"] = bool(settings["enabled"])
+            if settings.get("root"):
+                resolved[source]["root"] = str(
+                    Path(settings["root"]).expanduser()
+                )
+    return resolved
 
 
 def get_db_path(override: str = None) -> Path:
@@ -133,46 +223,42 @@ def init_config():
 
 
 def ensure_indexed(db_path: Path = None) -> bool:
-    """Auto-index on first use if database is empty or missing.
-
-    Returns True if backfill was triggered.
-    """
-    import sqlite3
-
+    """Migrate the database and index each enabled source once."""
     if db_path is None:
         db_path = get_db_path()
 
-    needs_backfill = False
-    if not db_path.exists():
-        needs_backfill = True
-    else:
+    try:
+        from session_index.indexer import SessionIndexer
+    except ImportError:
         try:
-            conn = sqlite3.connect(str(db_path))
-            has_table = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'"
-            ).fetchone()
-            if has_table:
-                count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-                needs_backfill = (count == 0)
-            else:
-                needs_backfill = True
-            conn.close()
-        except Exception:
-            needs_backfill = True
-
-    if needs_backfill:
-        print("\n  First run — indexing all your sessions...")
-        print("  (This only happens once.)\n")
-        try:
-            from session_index.indexer import SessionIndexer
+            from .indexer import SessionIndexer
         except ImportError:
-            try:
-                from .indexer import SessionIndexer
-            except ImportError:
-                from indexer import SessionIndexer
-        indexer = SessionIndexer(db_path=db_path)
-        indexer.connect()
-        indexer.backfill_all()
-        indexer.close()
+            from indexer import SessionIndexer
+
+    indexer = SessionIndexer(db_path=db_path)
+    indexer.connect()
+    try:
+        initialized = {
+            row[0] for row in indexer.conn.execute(
+                "SELECT source FROM index_state"
+            ).fetchall()
+        }
+        missing = [
+            source for source in indexer.adapters
+            if source not in initialized
+        ]
+        if not missing:
+            return False
+        print(
+            "\n  Indexing newly enabled local session sources: "
+            + ", ".join(missing)
+            + "\n"
+        )
+        if set(missing) == set(indexer.adapters):
+            indexer.backfill_all()
+        else:
+            for source in missing:
+                indexer.backfill_all(source=source)
         return True
-    return False
+    finally:
+        indexer.close()

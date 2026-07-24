@@ -1,485 +1,341 @@
 #!/usr/bin/env python3
-"""
-Session search — CLI + importable module.
+"""Search and filtering APIs for the unified local session index."""
 
-Search and query the session index database.
+from __future__ import annotations
 
-Usage:
-    python3 -m session_index.search search "query"
-    python3 -m session_index.search find --client "Connection Lab" --tag "hook"
-    python3 -m session_index.search topics <session_id>
-    python3 -m session_index.search recent [N]
-    python3 -m session_index.search stats
-    python3 -m session_index.search tools <tool_name>
-"""
-
-import json
-import sys
 import sqlite3
-from pathlib import Path
 from datetime import datetime, timedelta
+from pathlib import Path
 
 try:
     from . import config
 except ImportError:
     import config
 
+VALID_SOURCES = ("claude", "codex")
+
 
 def _escape_fts_query(query: str) -> str:
-    """Escape a user query for FTS5 MATCH safety.
-
-    Wraps each token in double quotes so periods, hyphens, and
-    reserved words (AND, OR, NOT, NEAR) are treated as literals.
-    If the user already quoted a phrase, leave it intact.
-    """
+    """Quote FTS tokens while preserving explicitly quoted phrases."""
     if not query or not query.strip():
         return ""
-
     tokens = []
-    i = 0
+    index = 0
     chars = query.strip()
-
-    while i < len(chars):
-        # Skip whitespace
-        if chars[i].isspace():
-            i += 1
+    while index < len(chars):
+        if chars[index].isspace():
+            index += 1
             continue
-
-        # Already-quoted phrase — preserve it verbatim
-        if chars[i] == '"':
-            end = chars.find('"', i + 1)
+        if chars[index] == '"':
+            end = chars.find('"', index + 1)
             if end == -1:
-                # Unterminated quote — wrap the rest as a single token
-                tokens.append(f'"{chars[i + 1:]}"')
+                tokens.append(f'"{chars[index + 1:]}"')
                 break
-            tokens.append(chars[i:end + 1])
-            i = end + 1
+            tokens.append(chars[index:end + 1])
+            index = end + 1
         else:
-            # Unquoted token — collect until next whitespace or quote
-            start = i
-            while i < len(chars) and not chars[i].isspace() and chars[i] != '"':
-                i += 1
-            token = chars[start:i]
-            tokens.append(f'"{token}"')
-
+            start = index
+            while (
+                index < len(chars)
+                and not chars[index].isspace()
+                and chars[index] != '"'
+            ):
+                index += 1
+            tokens.append(f'"{chars[start:index]}"')
     return " ".join(tokens)
+
+
+def resume_command(source: str, session_id: str) -> str:
+    if source == "codex":
+        return f"codex resume {session_id}"
+    return f"claude --resume {session_id}"
 
 
 class SessionSearch:
     def __init__(self, db_path: Path = None):
-        self.db_path = db_path or config.get_db_path()
-        self.conn = None
+        self.db_path = Path(db_path) if db_path else config.get_db_path()
+        self.conn: sqlite3.Connection | None = None
 
     def connect(self):
         self.conn = sqlite3.connect(str(self.db_path))
         self.conn.row_factory = sqlite3.Row
+        columns = {
+            row["name"]
+            for row in self.conn.execute("PRAGMA table_info(sessions)")
+        }
+        if columns and "source" not in columns:
+            self.conn.close()
+            try:
+                from .indexer import SessionIndexer
+            except ImportError:
+                from indexer import SessionIndexer
+            indexer = SessionIndexer(self.db_path)
+            indexer.connect()
+            indexer.close()
+            self.conn = sqlite3.connect(str(self.db_path))
+            self.conn.row_factory = sqlite3.Row
 
     def close(self):
         if self.conn:
             self.conn.close()
+            self.conn = None
 
-    def search(self, query: str, limit: int = 20) -> list[dict]:
-        """Full-text search across all session content."""
-        rows = self.conn.execute("""
-            SELECT s.session_id, s.project_name, s.title, s.title_display,
-                   s.client, s.tags, s.exchange_count, s.start_time,
-                   s.duration_minutes, s.has_compaction,
-                   snippet(session_content, 1, '>>>', '<<<', '...', 40) as snippet
+    @staticmethod
+    def _source_condition(source: str | None, alias: str = "s"):
+        if source and source not in VALID_SOURCES:
+            raise ValueError(f"Unknown source: {source}")
+        return (f"{alias}.source = ?", [source]) if source else ("1=1", [])
+
+    def search(self, query: str, limit: int = 20,
+               source: str | None = None) -> list[dict]:
+        source_clause, source_params = self._source_condition(source)
+        rows = self.conn.execute(f"""
+            SELECT s.source, s.session_id, s.project_name, s.title,
+                   s.title_display, s.client, s.tags, s.exchange_count,
+                   s.start_time, s.duration_minutes, s.has_compaction,
+                   snippet(session_content, 2, '>>>', '<<<', '...', 40)
+                       AS snippet
             FROM session_content
-            JOIN sessions s ON s.session_id = session_content.session_id
-            WHERE session_content MATCH ?
+            JOIN sessions s
+              ON s.source = session_content.source
+             AND s.session_id = session_content.session_id
+            WHERE session_content MATCH ? AND {source_clause}
             ORDER BY rank
             LIMIT ?
-        """, (_escape_fts_query(query), limit)).fetchall()
+        """, [_escape_fts_query(query), *source_params, limit]).fetchall()
+        return [self._with_topics(row) for row in rows]
 
-        results = []
-        for row in rows:
-            r = dict(row)
-            r['topics'] = self._get_topics(row['session_id'])
-            results.append(r)
-        return results
-
-    def find(self, client: str = None, tag: str = None, tool: str = None,
-             agent: str = None, date: str = None, week: bool = False,
-             days: int = None, project: str = None,
-             exclude_project: str = None, has_compaction: bool = None,
-             limit: int = 20) -> list[dict]:
-        """Filter sessions by various criteria."""
+    def find(
+        self,
+        client: str = None,
+        tag: str = None,
+        tool: str = None,
+        agent: str = None,
+        date: str = None,
+        week: bool = False,
+        days: int = None,
+        project: str = None,
+        exclude_project: str = None,
+        has_compaction: bool = None,
+        limit: int = 20,
+        source: str | None = None,
+    ) -> list[dict]:
         conditions = []
         params = []
-
+        source_clause, source_params = self._source_condition(source)
+        conditions.append(source_clause)
+        params.extend(source_params)
         if client:
             conditions.append("s.client LIKE ?")
             params.append(f"%{client}%")
-
         if tag:
             conditions.append("s.tags LIKE ?")
             params.append(f"%{tag}%")
-
         if tool:
-            conditions.append("s.session_id IN (SELECT session_id FROM session_tools WHERE tool_name LIKE ?)")
+            conditions.append("""
+                EXISTS (
+                    SELECT 1 FROM session_tools st
+                    WHERE st.session_source=s.source
+                      AND st.session_id=s.session_id
+                      AND st.tool_name LIKE ?
+                )
+            """)
             params.append(f"%{tool}%")
-
         if agent:
-            conditions.append("s.session_id IN (SELECT session_id FROM session_agents WHERE agent_name LIKE ?)")
+            conditions.append("""
+                EXISTS (
+                    SELECT 1 FROM session_agents sa
+                    WHERE sa.session_source=s.source
+                      AND sa.session_id=s.session_id
+                      AND sa.agent_name LIKE ?
+                )
+            """)
             params.append(f"%{agent}%")
-
         if project:
             conditions.append("(s.project_name LIKE ? OR s.project LIKE ?)")
             params.extend([f"%{project}%", f"%{project}%"])
-
         if date:
             conditions.append("s.start_time LIKE ?")
             params.append(f"{date}%")
-
         if week:
-            week_ago = (datetime.now() - timedelta(days=7)).isoformat()
             conditions.append("s.start_time >= ?")
-            params.append(week_ago)
-
+            params.append((datetime.now() - timedelta(days=7)).isoformat())
         if days:
-            days_ago = (datetime.now() - timedelta(days=days)).isoformat()
             conditions.append("s.start_time >= ?")
-            params.append(days_ago)
-
+            params.append((datetime.now() - timedelta(days=days)).isoformat())
         if exclude_project:
-            conditions.append("NOT (s.project_name LIKE ? OR s.project LIKE ?)")
-            params.extend([f"%{exclude_project}%", f"%{exclude_project}%"])
-
+            conditions.append(
+                "NOT (s.project_name LIKE ? OR s.project LIKE ?)"
+            )
+            params.extend([
+                f"%{exclude_project}%", f"%{exclude_project}%"
+            ])
         if has_compaction is not None:
             conditions.append("s.has_compaction = ?")
-            params.append(1 if has_compaction else 0)
+            params.append(int(has_compaction))
 
-        where = " AND ".join(conditions) if conditions else "1=1"
         params.append(limit)
-
         rows = self.conn.execute(f"""
-            SELECT s.session_id, s.project_name, s.title, s.title_display,
-                   s.client, s.tags, s.exchange_count, s.start_time,
-                   s.duration_minutes, s.has_compaction
+            SELECT s.source, s.session_id, s.project_name, s.title,
+                   s.title_display, s.client, s.tags, s.exchange_count,
+                   s.start_time, s.duration_minutes, s.has_compaction
             FROM sessions s
-            WHERE {where}
+            WHERE {' AND '.join(conditions)}
             ORDER BY s.start_time DESC
             LIMIT ?
         """, params).fetchall()
+        return [self._with_topics(row) for row in rows]
 
-        results = []
-        for row in rows:
-            r = dict(row)
-            r['topics'] = self._get_topics(row['session_id'])
-            results.append(r)
-        return results
+    def resolve_session(self, session_id: str,
+                        source: str | None = None) -> dict | None:
+        if ":" in session_id and not source:
+            prefix, value = session_id.split(":", 1)
+            if prefix in VALID_SOURCES:
+                source, session_id = prefix, value
+        source_clause, params = self._source_condition(source)
+        rows = self.conn.execute(f"""
+            SELECT * FROM sessions s
+            WHERE {source_clause} AND s.session_id LIKE ?
+            ORDER BY CASE WHEN s.session_id=? THEN 0 ELSE 1 END
+            LIMIT 2
+        """, [*params, f"{session_id}%", session_id]).fetchall()
+        if len(rows) != 1:
+            return None
+        return dict(rows[0])
 
-    def topics(self, session_id: str) -> list[dict]:
-        """Get topic timeline for a session."""
+    def topics(self, session_id: str,
+               source: str | None = None) -> list[dict]:
+        resolved = self.resolve_session(session_id, source)
+        if not resolved:
+            return []
         rows = self.conn.execute("""
             SELECT topic, captured_at, exchange_number, source
             FROM session_topics
-            WHERE session_id = ?
+            WHERE session_source=? AND session_id=?
             ORDER BY captured_at
-        """, (session_id,)).fetchall()
-        return [dict(r) for r in rows]
+        """, (resolved["source"], resolved["session_id"])).fetchall()
+        return [dict(row) for row in rows]
 
-    def recent(self, n: int = 10) -> list[dict]:
-        """Get N most recent sessions."""
-        return self.find(limit=n)
+    def recent(self, n: int = 10,
+               source: str | None = None) -> list[dict]:
+        return self.find(limit=n, source=source)
 
-    def stats(self) -> dict:
-        """Get overall statistics."""
+    def stats(self, source: str | None = None) -> dict:
         try:
-            from session_index.indexer import SessionIndexer
+            from .indexer import SessionIndexer
         except ImportError:
-            try:
-                from .indexer import SessionIndexer
-            except ImportError:
-                try:
-                    from session_indexer import SessionIndexer
-                except ImportError:
-                    return {"error": "SessionIndexer not available"}
+            from indexer import SessionIndexer
         indexer = SessionIndexer(self.db_path)
         indexer.conn = self.conn
-        return indexer.get_stats()
+        return indexer.get_stats(source)
 
-    def tools_usage(self, tool_name: str = None, limit: int = 20) -> list[dict]:
-        """Find sessions using a specific tool, or show top tools."""
+    def tools_usage(self, tool_name: str = None, limit: int = 20,
+                    source: str | None = None) -> list[dict]:
+        conditions = []
+        params = []
+        if source:
+            conditions.append("st.session_source=?")
+            params.append(source)
         if tool_name:
-            rows = self.conn.execute("""
-                SELECT s.session_id, s.title, s.title_display, s.start_time,
-                       st.tool_name, st.use_count
+            conditions.append("st.tool_name LIKE ?")
+            params.append(f"%{tool_name}%")
+            where = "WHERE " + " AND ".join(conditions)
+            params.append(limit)
+            rows = self.conn.execute(f"""
+                SELECT s.source, s.session_id, s.title, s.title_display,
+                       s.start_time, st.tool_name, st.use_count
                 FROM session_tools st
-                JOIN sessions s ON s.session_id = st.session_id
-                WHERE st.tool_name LIKE ?
+                JOIN sessions s
+                  ON s.source=st.session_source AND s.session_id=st.session_id
+                {where}
                 ORDER BY st.use_count DESC
                 LIMIT ?
-            """, (f"%{tool_name}%", limit)).fetchall()
+            """, params).fetchall()
         else:
-            rows = self.conn.execute("""
-                SELECT tool_name, SUM(use_count) as total,
-                       COUNT(DISTINCT session_id) as session_count
-                FROM session_tools
-                GROUP BY tool_name
+            where = (
+                "WHERE " + " AND ".join(conditions) if conditions else ""
+            )
+            params.append(limit)
+            rows = self.conn.execute(f"""
+                SELECT st.tool_name, SUM(st.use_count) AS total,
+                       COUNT(DISTINCT st.session_source || ':' || st.session_id)
+                           AS session_count
+                FROM session_tools st
+                {where}
+                GROUP BY st.tool_name
                 ORDER BY total DESC
                 LIMIT ?
-            """, (limit,)).fetchall()
-        return [dict(r) for r in rows]
+            """, params).fetchall()
+        return [dict(row) for row in rows]
 
-    def _get_topics(self, session_id: str) -> list[dict]:
-        """Get topics for a session (compact)."""
+    def _with_topics(self, row: sqlite3.Row) -> dict:
+        result = dict(row)
+        result["topics"] = self._get_topics(
+            result["source"], result["session_id"]
+        )
+        return result
+
+    def _get_topics(self, source: str, session_id: str) -> list[dict]:
         rows = self.conn.execute("""
             SELECT topic, source
             FROM session_topics
-            WHERE session_id = ?
+            WHERE session_source=? AND session_id=?
             ORDER BY captured_at
             LIMIT 10
-        """, (session_id,)).fetchall()
-        return [dict(r) for r in rows]
+        """, (source, session_id)).fetchall()
+        return [dict(row) for row in rows]
 
 
-def format_result(r: dict, show_topics: bool = True) -> str:
-    """Format a single search result for CLI output."""
+def format_result(result: dict, show_topics: bool = True) -> str:
     lines = []
-
-    # Title line with bullet
-    sid = r['session_id'][:8]
-    title = r.get('title_display') or r.get('title') or '(unnamed)'
+    source = result.get("source", "claude")
+    short_id = result["session_id"][:8]
+    title = (
+        result.get("title_display") or result.get("title") or "(unnamed)"
+    )
     if len(title) > 70:
-        title = title[:67] + '...'
-    lines.append(f"  ◆ {sid} · {title}")
-
-    # Metadata line
+        title = title[:67] + "..."
+    lines.append(f"  ◆ [{source}] {short_id} · {title}")
     meta = []
-    if r.get('start_time'):
-        meta.append(r['start_time'][:10])
-    if r.get('project_name'):
-        meta.append(r['project_name'])
-    if r.get('client'):
-        meta.append(r['client'])
-    if r.get('exchange_count'):
-        meta.append(f"{r['exchange_count']} exchanges")
-    if r.get('duration_minutes'):
-        meta.append(f"{r['duration_minutes']}min")
-    if r.get('has_compaction'):
+    if result.get("start_time"):
+        meta.append(result["start_time"][:10])
+    if result.get("project_name"):
+        meta.append(result["project_name"])
+    if result.get("client"):
+        meta.append(result["client"])
+    if result.get("exchange_count"):
+        meta.append(f"{result['exchange_count']} exchanges")
+    if result.get("duration_minutes"):
+        meta.append(f"{result['duration_minutes']}min")
+    if result.get("has_compaction"):
         meta.append("compacted")
     if meta:
         lines.append(f"    {' · '.join(meta)}")
-
-    # Snippet (from FTS search)
-    if r.get('snippet'):
-        snippet = r['snippet'].replace('>>>', '').replace('<<<', '').replace('\n', ' ')[:120]
-        lines.append(f"    \"{snippet}\"")
-
-    # Topics
-    if show_topics and r.get('topics'):
-        topic_strs = [t['topic'] for t in r['topics'][:5]]
-        if topic_strs:
-            lines.append(f"    topics: {' → '.join(topic_strs)}")
-
-    # Tags
-    if r.get('tags'):
-        lines.append(f"    [{r['tags']}]")
-
-    # Resume command — visually distinct as an action
-    lines.append(f"    → claude --resume {r['session_id']}")
-
-    return '\n'.join(lines)
+    if result.get("snippet"):
+        snippet = (
+            result["snippet"].replace(">>>", "").replace("<<<", "")
+            .replace("\n", " ")[:120]
+        )
+        lines.append(f'    "{snippet}"')
+    if show_topics and result.get("topics"):
+        topics = [topic["topic"] for topic in result["topics"][:5]]
+        if topics:
+            lines.append(f"    topics: {' → '.join(topics)}")
+    if result.get("tags"):
+        lines.append(f"    [{result['tags']}]")
+    lines.append(
+        f"    → {resume_command(source, result['session_id'])}"
+    )
+    return "\n".join(lines)
 
 
 def main():
-    import argparse
-    parser = argparse.ArgumentParser(description="Session search")
-    parser.add_argument('--db-path', type=str, default=None,
-                        help='Path to sessions.db (overrides config)')
-    subparsers = parser.add_subparsers(dest='command')
-
-    # search
-    sp = subparsers.add_parser('search', help='Full-text search')
-    sp.add_argument('query', help='Search query')
-    sp.add_argument('-n', '--limit', type=int, default=20)
-    sp.add_argument('--context', action='store_true',
-                    help='Show conversation exchanges inline with results')
-
-    # find
-    sp = subparsers.add_parser('find', help='Filter sessions')
-    sp.add_argument('--client', help='Filter by client name')
-    sp.add_argument('--tag', help='Filter by tag')
-    sp.add_argument('--tool', help='Filter by tool used')
-    sp.add_argument('--agent', help='Filter by agent used')
-    sp.add_argument('--date', help='Filter by date (YYYY-MM-DD)')
-    sp.add_argument('--week', action='store_true', help='Last 7 days')
-    sp.add_argument('--project', help='Filter by project')
-    sp.add_argument('--compacted', action='store_true', help='Only compacted sessions')
-    sp.add_argument('-n', '--limit', type=int, default=20)
-
-    # topics
-    sp = subparsers.add_parser('topics', help='Topic timeline for a session')
-    sp.add_argument('session_id', help='Session ID (full or prefix)')
-
-    # recent
-    sp = subparsers.add_parser('recent', help='Recent sessions')
-    sp.add_argument('n', nargs='?', type=int, default=10)
-
-    # stats
-    subparsers.add_parser('stats', help='Database statistics')
-
-    # tools
-    sp = subparsers.add_parser('tools', help='Tool usage')
-    sp.add_argument('tool_name', nargs='?', help='Specific tool to search for')
-
-    args = parser.parse_args()
-
-    if not args.command:
-        parser.print_help()
-        sys.exit(0)
-
-    db_path = Path(args.db_path) if args.db_path else config.get_db_path()
-    config.ensure_indexed(db_path)
-    searcher = SessionSearch(db_path=db_path)
-    searcher.connect()
-
+    # Keep the legacy session-search entrypoint while sharing the unified CLI.
     try:
-        if args.command == 'search':
-            results = searcher.search(args.query, args.limit)
-            if not results:
-                print(f"No results for: {args.query}")
-                return
-            print(f"\n🔍 {len(results)} results for \"{args.query}\"\n")
-            for r in results:
-                print(format_result(r))
-                if args.context:
-                    try:
-                        from session_index.analyzer import get_context
-                    except ImportError:
-                        try:
-                            from .analyzer import get_context
-                        except ImportError:
-                            try:
-                                from session_analyzer import get_context
-                            except ImportError:
-                                print("    (context not available — analyzer module not found)")
-                                print()
-                                continue
-                    ctx = get_context(r['session_id'], query=args.query, limit=3)
-                    if ctx.get('exchanges'):
-                        for ex in ctx['exchanges']:
-                            ts = ex['timestamp'][:16] if ex['timestamp'] else ''
-                            try:
-                                dt = datetime.fromisoformat(ts)
-                                ts_display = dt.strftime("%b %d, %H:%M")
-                            except (ValueError, TypeError):
-                                ts_display = ts
-                            print(f"    ┌─ {ts_display} {'─' * max(1, 36 - len(ts_display))}")
-                            user_preview = ex['user'][:250].replace('\n', ' ')
-                            asst_preview = ex['assistant'][:250].replace('\n', ' ')
-                            print(f"    │ 🧑 {user_preview}")
-                            print(f"    │ 🤖 {asst_preview}")
-                            print(f"    └{'─' * 42}")
-                print()
-
-        elif args.command == 'find':
-            results = searcher.find(
-                client=args.client, tag=args.tag, tool=args.tool,
-                agent=args.agent, date=args.date, week=args.week,
-                project=args.project,
-                has_compaction=True if args.compacted else None,
-                limit=args.limit,
-            )
-            if not results:
-                print("No sessions match those filters.")
-                return
-            print(f"\n📋 {len(results)} sessions\n")
-            for r in results:
-                print(format_result(r))
-                print()
-
-        elif args.command == 'topics':
-            # Support partial session ID
-            sid = args.session_id
-            if len(sid) < 36:
-                row = searcher.conn.execute(
-                    "SELECT session_id FROM sessions WHERE session_id LIKE ?", (f"{sid}%",)
-                ).fetchone()
-                if row:
-                    sid = row['session_id']
-                else:
-                    print(f"No session found matching: {sid}")
-                    return
-
-            topics = searcher.topics(sid)
-            if not topics:
-                print(f"No topics recorded for session {sid[:8]}")
-                return
-
-            # Get session info
-            session = searcher.conn.execute(
-                "SELECT title_display, start_time, project_name FROM sessions WHERE session_id=?",
-                (sid,)
-            ).fetchone()
-
-            if session:
-                title = session['title_display'] or '(unnamed)'
-                print(f"\n╭─── {title} {'─' * max(1, 44 - len(title))}")
-                meta = []
-                if session['start_time']:
-                    meta.append(session['start_time'][:16])
-                if session['project_name']:
-                    meta.append(session['project_name'])
-                print(f"│ {' · '.join(meta)}")
-                print(f"╰{'─' * 48}")
-
-            print(f"\n💬 Topic timeline ({len(topics)} entries)\n")
-            for t in topics:
-                ts = t['captured_at'][:16] if t['captured_at'] else ''
-                ex = f" (exchange {t['exchange_number']})" if t['exchange_number'] else ''
-                src = t['source']
-                print(f"  [{src:20s}] {ts}{ex}")
-                print(f"                       {t['topic']}")
-                print()
-
-        elif args.command == 'recent':
-            results = searcher.recent(args.n)
-            print(f"\n📋 Last {len(results)} sessions\n")
-            for r in results:
-                print(format_result(r))
-                print()
-
-        elif args.command == 'stats':
-            stats = searcher.stats()
-            print(f"\n📊 Database overview")
-            print(f"{'═' * 40}")
-            print(f"  Sessions:  {stats.get('total_sessions', 0)}")
-            print(f"  Topics:    {stats.get('total_topics', 0)}")
-            print(f"  Tools:     {stats.get('total_tools', 0)} distinct")
-            print(f"  Agents:    {stats.get('total_agents', 0)} distinct")
-            dr = stats.get('date_range', {})
-            if dr.get('earliest'):
-                print(f"  Range:     {dr['earliest']} → {dr['latest']}")
-            if stats.get('by_project'):
-                print(f"\n  📁 By project")
-                print(f"  {'─' * 36}")
-                for name, cnt in list(stats['by_project'].items())[:10]:
-                    print(f"  {name:25s}  {cnt:>5d}")
-            if stats.get('top_tools'):
-                print(f"\n  🔧 Top tools")
-                print(f"  {'─' * 36}")
-                for name, cnt in list(stats['top_tools'].items())[:10]:
-                    print(f"  {name:25s}  {cnt:>5d}")
-            print()
-
-        elif args.command == 'tools':
-            results = searcher.tools_usage(args.tool_name)
-            if args.tool_name:
-                print(f"\n🔧 Sessions using '{args.tool_name}'\n")
-                for r in results:
-                    sid = r['session_id'][:8]
-                    title = r.get('title_display') or r.get('title') or '(unnamed)'
-                    print(f"  ◆ {sid} · {r['tool_name']} ×{r['use_count']}  {title}")
-            else:
-                print(f"\n🔧 Top tools across all sessions\n")
-                for r in results:
-                    print(f"  {r['tool_name']:25s}  {r['total']:>6d} uses  ({r['session_count']} sessions)")
-
-    finally:
-        searcher.close()
+        from .cli import main as cli_main
+    except ImportError:
+        from cli import main as cli_main
+    cli_main()
 
 
 if __name__ == "__main__":
