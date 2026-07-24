@@ -172,6 +172,13 @@ Tests use sanitized Claude and Codex JSONL fixtures and cover adapters,
 source-qualified collisions, FTS filtering, context routing, CLI labels,
 analytics, configuration, and schema migration.
 
+## Attribution
+
+Agent Session Index is adapted from
+[Claude Session Index](https://github.com/lee-fuhr/claude-session-index) by
+Lee Fuhr. The original project was released under the MIT License, and its
+copyright and license notice are retained in [LICENSE](LICENSE).
+
 ## License
 
 MIT
