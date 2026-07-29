@@ -87,8 +87,14 @@ sessions index --backfill
 
 - Database: `~/.session-index/sessions.db`
 - Claude transcripts: `~/.claude/projects`
-- Codex transcripts: `~/.codex/sessions`
+- Codex transcripts: `~/.codex/sessions` and `~/.codex/archived_sessions`
 - Config: `~/.session-index/config.json`
 
 The first command migrates an existing Claude-only database safely and
 initializes newly enabled sources. Indexing and retrieval remain local.
+
+Archived sessions stay searchable. Claude Desktop's Archive only flags its own
+sidebar record and leaves the transcript in `~/.claude/projects`; `codex` moves the
+rollout into `archived_sessions/`, which is indexed as a second Codex root. What does
+drop out is a *deleted* transcript — the row and its indexed text survive, so search
+still finds it, but `sessions context` reads the file and returns no exchanges.

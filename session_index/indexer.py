@@ -496,10 +496,12 @@ class SessionIndexer:
                 session_id = path.stem
 
             existing = self.conn.execute("""
-                SELECT file_hash FROM sessions
+                SELECT file_hash, file_path FROM sessions
                 WHERE source=? AND session_id=?
             """, (name, session_id)).fetchone()
-            if existing and existing["file_hash"] == current_hash:
+            # A relocated transcript keeps its hash, so file_path must match too
+            if (existing and existing["file_hash"] == current_hash
+                    and existing["file_path"] == str(path)):
                 stats[unchanged_key] += 1
                 source_stats["unchanged"] += 1
                 continue

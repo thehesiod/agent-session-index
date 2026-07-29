@@ -4,6 +4,12 @@
 
 - Rename the package and user-facing product to Agent Session Index.
 - Add a source adapter boundary and local Codex rollout support.
+- Index Codex rollouts that `codex` archived into `archived_sessions/`, discovered as
+  a sibling of whichever Codex root is in effect.
+- Refresh `file_path` when a transcript moves. The unchanged-check compared only the
+  content hash, so a relocated transcript — an archived Codex rollout, a renamed
+  Claude project directory — kept a row pointing at a path that no longer existed,
+  and `sessions context` could not read it back.
 - Migrate existing Claude-only databases to source-qualified identities.
 - Add source labels and filters to search, context, recent, find, analytics,
   tools, topics, stats, and indexing commands.

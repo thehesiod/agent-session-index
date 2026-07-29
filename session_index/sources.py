@@ -405,10 +405,19 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
 class CodexSourceAdapter(SessionSourceAdapter):
     source = "codex"
 
+    # codex archives a session by MOVING its rollout into a sibling archived_sessions/
+    ARCHIVED_DIR = "archived_sessions"
+
+    def _roots(self) -> Iterable[Path]:
+        yield self.root
+        archived = self.root.parent / self.ARCHIVED_DIR
+        if not archived.is_relative_to(self.root):
+            yield archived
+
     def discover(self) -> Iterable[Path]:
-        if not self.root.exists():
-            return []
-        return self.root.rglob("*.jsonl")
+        for root in self._roots():
+            if root.exists():
+                yield from root.rglob("*.jsonl")
 
     def parse(self, path: Path) -> Optional[dict]:
         session_id = path.stem

@@ -21,8 +21,12 @@ sessions "webhook debugging"
 Default transcript roots:
 
 - Claude Code: `~/.claude/projects`
-- Codex: `~/.codex/sessions`
+- Codex: `~/.codex/sessions`, plus the sibling `~/.codex/archived_sessions`
 - Unified database: `~/.session-index/sessions.db`
+
+Archiving a session never removes it from the index. The Claude Desktop app archives
+by flagging its own sidebar record and leaves the transcript in place, and `codex`
+moves the rollout into `archived_sessions/`, which is indexed as a second Codex root.
 
 Existing databases created by `claude-session-index` are migrated in place.
 Their existing rows are backfilled with `source=claude`; the Codex source is
@@ -121,6 +125,9 @@ sessions index --backfill \
   --claude-root /path/to/.claude/projects \
   --codex-root /path/to/.codex/sessions
 ```
+
+The Codex root's `archived_sessions` sibling is derived from whatever root is in
+effect, so an override picks up that installation's archived rollouts too.
 
 ## What gets indexed
 

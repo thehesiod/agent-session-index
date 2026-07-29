@@ -68,6 +68,19 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(metadata["git"]["branch"], "fixture")
         self.assertNotIn("base_instructions", metadata)
 
+    def test_codex_adapter_discovers_archived_rollouts(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "sessions"
+            archived = Path(tempdir) / "archived_sessions"
+            root.mkdir()
+            archived.mkdir()
+            (root / "live.jsonl").write_text("")
+            (archived / "archived.jsonl").write_text("")
+
+            found = {path.name for path in CodexSourceAdapter(root).discover()}
+
+        self.assertEqual(found, {"live.jsonl", "archived.jsonl"})
+
 
 class IndexIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -171,6 +184,45 @@ class IndexIntegrationTests(unittest.TestCase):
         self.assertIn("[codex]", output)
         self.assertIn("codex resume shared-session", output)
         self.assertNotIn("[claude]", output)
+
+
+class RelocationTests(unittest.TestCase):
+    def test_moved_transcript_refreshes_file_path(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            (root / "-old-project").mkdir(parents=True)
+            transcript = root / "-old-project" / "moved-session.jsonl"
+            transcript.write_text(json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "cobalt-needle"},
+                "timestamp": "2026-01-01T00:00:00Z",
+            }) + "\n")
+
+            indexer = SessionIndexer(
+                db_path=Path(tempdir) / "sessions.db",
+                source_configs={
+                    "claude": {"enabled": True, "root": str(root)},
+                    "codex": {"enabled": False, "root": str(CODEX_ROOT)},
+                },
+            )
+            indexer.connect()
+            try:
+                indexer.backfill_all(progress_interval=0)
+                moved = root / "-new-project" / transcript.name
+                moved.parent.mkdir()
+                transcript.rename(moved)
+
+                stats = indexer.backfill_all(progress_interval=0)
+
+                self.assertEqual(stats["indexed"], 1)
+                row = indexer.conn.execute(
+                    "SELECT file_path, project FROM sessions "
+                    "WHERE source='claude' AND session_id='moved-session'"
+                ).fetchone()
+                self.assertEqual(row["file_path"], str(moved))
+                self.assertEqual(row["project"], "-new-project")
+            finally:
+                indexer.close()
 
 
 class MigrationTests(unittest.TestCase):
