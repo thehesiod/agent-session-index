@@ -95,6 +95,8 @@ initializes newly enabled sources. Indexing and retrieval remain local.
 
 Archived sessions stay searchable. Claude Desktop's Archive only flags its own
 sidebar record and leaves the transcript in `~/.claude/projects`; `codex` moves the
-rollout into `archived_sessions/`, which is indexed as a second Codex root. What does
-drop out is a *deleted* transcript — the row and its indexed text survive, so search
-still finds it, but `sessions context` reads the file and returns no exchanges.
+rollout into `archived_sessions/`, which is indexed as a second Codex root.
+
+A *deleted* transcript still searches, because its indexed text lives in the database.
+`sessions context` says the file is gone and falls back to that text, so the messages
+read back without user/assistant pairing or tool calls.

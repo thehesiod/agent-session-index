@@ -28,6 +28,10 @@ Archiving a session never removes it from the index. The Claude Desktop app arch
 by flagging its own sidebar record and leaves the transcript in place, and `codex`
 moves the rollout into `archived_sessions/`, which is indexed as a second Codex root.
 
+Deleting a transcript is what costs you something. The row and its searchable text
+stay, so `sessions context` still reads the messages back out of the index, but
+without exchange pairing or tool calls.
+
 Existing databases created by `claude-session-index` are migrated in place.
 Their existing rows are backfilled with `source=claude`; the Codex source is
 then initialized without discarding Claude data.

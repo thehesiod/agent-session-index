@@ -49,6 +49,8 @@ def _print_inline_context(result: dict, query: str, db_path: Path):
         result["session_id"], query=query, limit=3, db_path=db_path,
         source=result["source"],
     )
+    for block in context.get("excerpts") or []:
+        print(f"    │ 📄 {block[:250]}")
     for exchange in context.get("exchanges", []):
         timestamp = exchange["timestamp"][:16] if exchange["timestamp"] else ""
         try:

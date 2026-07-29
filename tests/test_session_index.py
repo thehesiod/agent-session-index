@@ -9,7 +9,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from session_index import cli, config
-from session_index.analyzer import analytics, get_context, synthesize
+from session_index.analyzer import (
+    analytics,
+    format_context,
+    get_context,
+    synthesize,
+)
 from session_index.indexer import SCHEMA_VERSION, SessionIndexer
 from session_index.search import SessionSearch
 from session_index.sources import ClaudeSourceAdapter, CodexSourceAdapter
@@ -223,6 +228,44 @@ class RelocationTests(unittest.TestCase):
                 self.assertEqual(row["project"], "-new-project")
             finally:
                 indexer.close()
+
+
+class DeletedTranscriptTests(unittest.TestCase):
+    def test_context_falls_back_to_indexed_text(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            (root / "-project").mkdir(parents=True)
+            transcript = root / "-project" / "reaped-session.jsonl"
+            transcript.write_text(json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "cobalt-needle stays"},
+                "timestamp": "2026-01-01T00:00:00Z",
+            }) + "\n")
+
+            db_path = Path(tempdir) / "sessions.db"
+            indexer = SessionIndexer(
+                db_path=db_path,
+                source_configs={
+                    "claude": {"enabled": True, "root": str(root)},
+                    "codex": {"enabled": False, "root": str(CODEX_ROOT)},
+                },
+            )
+            indexer.connect()
+            try:
+                indexer.backfill_all(progress_interval=0)
+            finally:
+                indexer.close()
+            transcript.unlink()
+
+            result = get_context(
+                "reaped-session", query="cobalt-needle", db_path=db_path,
+                source="claude",
+            )
+
+        self.assertTrue(result["transcript_missing"])
+        self.assertEqual(result["exchanges"], [])
+        self.assertEqual(result["excerpts"], ["cobalt-needle stays"])
+        self.assertIn("recovered from the index", format_context(result))
 
 
 class MigrationTests(unittest.TestCase):

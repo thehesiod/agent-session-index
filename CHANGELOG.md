@@ -10,6 +10,9 @@
   content hash, so a relocated transcript — an archived Codex rollout, a renamed
   Claude project directory — kept a row pointing at a path that no longer existed,
   and `sessions context` could not read it back.
+- Fall back to the indexed text in `sessions context` when the transcript itself is
+  gone, instead of printing a read error and no exchanges. Retention sweeps delete
+  transcripts while the row and its searchable content remain.
 - Migrate existing Claude-only databases to source-qualified identities.
 - Add source labels and filters to search, context, recent, find, analytics,
   tools, topics, stats, and indexing commands.

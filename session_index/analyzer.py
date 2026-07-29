@@ -13,6 +13,7 @@ Usage:
     python3 -m session_index.analyzer synthesize "query" [--limit 10]
 """
 
+import re
 import sys
 import sqlite3
 from pathlib import Path
@@ -40,6 +41,29 @@ def extract_exchanges(session_path: str | Path, query: str = None,
     )
 
 
+def indexed_excerpts(conn: sqlite3.Connection, source: str, session_id: str,
+                     query: str = None, limit: int = 10,
+                     max_chars: int = 1000) -> list[str]:
+    """Recover readable text for a deleted transcript from the index itself."""
+    row = conn.execute(
+        "SELECT content FROM session_content WHERE source=? AND session_id=?",
+        (source, session_id),
+    ).fetchone()
+    if not row or not row["content"]:
+        return []
+
+    blocks = [block.strip() for block in row["content"].split("\n")]
+    blocks = [block for block in blocks if block]
+    if query:
+        try:
+            pattern = re.compile(query, re.IGNORECASE)
+        except re.error:
+            pattern = None
+        if pattern:
+            blocks = [block for block in blocks if pattern.search(block)]
+    return [block[:max_chars] for block in blocks[:limit]]
+
+
 def get_context(session_id: str, query: str = None, limit: int = 10,
                 db_path: Path = None, source: str = None) -> dict:
     """Get conversation context for a session.
@@ -61,37 +85,49 @@ def get_context(session_id: str, query: str = None, limit: int = 10,
     if source:
         clauses.append("source=?")
         params.append(source)
-    rows = conn.execute(
-        "SELECT source, session_id, file_path, title_display, project_name, "
-        "client, start_time, exchange_count, duration_minutes "
-        f"FROM sessions WHERE {' AND '.join(clauses)} "
-        "ORDER BY CASE WHEN session_id=? THEN 0 ELSE 1 END LIMIT 2",
-        [*params, session_id],
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            "SELECT source, session_id, file_path, title_display, project_name, "
+            "client, start_time, exchange_count, duration_minutes "
+            f"FROM sessions WHERE {' AND '.join(clauses)} "
+            "ORDER BY CASE WHEN session_id=? THEN 0 ELSE 1 END LIMIT 2",
+            [*params, session_id],
+        ).fetchall()
 
-    conn.close()
+        if not rows:
+            return {"error": f"Session not found: {session_id}"}
+        if len(rows) > 1:
+            return {
+                "error": (
+                    f"Session prefix is ambiguous: {session_id}. "
+                    "Pass --source claude or --source codex."
+                )
+            }
 
-    if not rows:
-        return {"error": f"Session not found: {session_id}"}
-    if len(rows) > 1:
-        return {
-            "error": (
-                f"Session prefix is ambiguous: {session_id}. "
-                "Pass --source claude or --source codex."
+        session_info = dict(rows[0])
+        transcript_missing = not Path(session_info["file_path"]).exists()
+        exchanges: list[dict] = []
+        excerpts: list[str] = []
+        if transcript_missing:
+            excerpts = indexed_excerpts(
+                conn, session_info["source"], session_info["session_id"],
+                query=query, limit=limit,
             )
-        }
-
-    session_info = dict(rows[0])
-    exchanges = extract_exchanges(
-        session_info["file_path"], query=query, limit=limit,
-        source=session_info["source"],
-    )
+        else:
+            exchanges = extract_exchanges(
+                session_info["file_path"], query=query, limit=limit,
+                source=session_info["source"],
+            )
+    finally:
+        conn.close()
 
     return {
         "session": session_info,
         "query": query,
         "exchanges": exchanges,
-        "total_matches": len(exchanges),
+        "excerpts": excerpts,
+        "transcript_missing": transcript_missing,
+        "total_matches": len(exchanges) + len(excerpts),
     }
 
 
@@ -119,6 +155,20 @@ def format_context(result: dict) -> str:
     lines.append(f"│ source: {s['source']}")
     lines.append(f"│ → {resume_command(s['source'], s['session_id'])}")
     lines.append(f"╰{'─' * 48}")
+
+    if result.get("transcript_missing"):
+        lines.append(
+            "\n⚠ transcript file is gone — showing text recovered from the index"
+        )
+        if result["query"]:
+            lines.append(f"\nMatching text for \"{result['query']}\":\n")
+        else:
+            lines.append(f"\nIndexed text ({result['total_matches']} shown):\n")
+        if not result.get("excerpts"):
+            lines.append("  (no text was stored for this session)")
+        for block in result.get("excerpts") or []:
+            lines.append(f"  │ {block}")
+        return "\n".join(lines)
 
     if result["query"]:
         lines.append(f"\nMatching exchanges for \"{result['query']}\":\n")
