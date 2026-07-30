@@ -84,6 +84,8 @@ sessions usage
 sessions usage --by session -n 10
 sessions usage --by agent --week
 sessions usage --by day --days 30 --subagents exclude
+sessions usage --by tool
+sessions usage --tool Read
 
 # Index all enabled sources, or one source
 sessions index
@@ -226,6 +228,29 @@ subtracted on the way in.
 Claude records the cache-write tiers separately, which cost different multipliers:
 `cache_write_1h_tokens` and `cache_write_5m_tokens`. `cache_write_tokens` never
 undercounts their sum, because some entries report a zero total beside a nonzero tier.
+
+### Per tool
+
+`sessions usage --by tool` splits the bill across tools, and `--tool <name>` breaks one
+tool down by session. Three separate costs, because they answer different questions:
+
+- `write` - output tokens the model spent emitting the tool call, taken from the usage
+  of the message that carried the `tool_use` block and split across the tools in it.
+- `inject` - billed input growth the result caused, measured as the delta in
+  `input + cache_write + cache_read` between consecutive calls and split across the
+  results that arrived in between, in proportion to payload size.
+- `result` - raw payload bytes the tool returned.
+
+`inject` is a first-read cost. A result then sits in context and is re-read on every
+later turn, which is where most of the cache-read total comes from; that amortized cost
+is not measured here.
+
+Context growth with no tool result in between - user messages, thinking blocks - is not
+attributed to any tool. A result whose call is not in the same transcript, from before a
+compaction or emitted by a parent session, lands under `unknown` rather than being
+smeared across the known tools.
+
+Codex records no per-call token split, so its tools report `result` bytes only.
 
 Caveats. Codex reports one cumulative total per rollout rather than per call, so a
 codex session gets a single row under its last known model, and `calls` counts model

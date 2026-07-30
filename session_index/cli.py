@@ -81,6 +81,22 @@ def _tokens(value: int | None) -> str:
     return str(value)
 
 
+def _bytes(value: int | None) -> str:
+    value = value or 0
+    for limit, suffix in ((1 << 30, "GB"), (1 << 20, "MB"), (1 << 10, "KB")):
+        if value >= limit:
+            return f"{value / limit:.1f}{suffix}"
+    return f"{value}B"
+
+
+def _usage_label(row: dict, per_session: bool) -> str:
+    label = str(row["grouping"] or "unknown")
+    if per_session:
+        short = label.split(":")[-1].removeprefix("agent-")[:8]
+        return f"{short} {row.get('title') or ''}".strip()
+    return label
+
+
 def _format_usage(rows: list[dict], by: str) -> str:
     width = max((len(str(row["grouping"] or "")) for row in rows), default=8)
     width = min(max(width, 8), 46)
@@ -94,9 +110,7 @@ def _format_usage(rows: list[dict], by: str) -> str:
          "cache_write_tokens", "cache_read_tokens"), 0
     )
     for row in rows:
-        label = str(row["grouping"] or "unknown")
-        if by == "session" and row.get("title"):
-            label = f"{label.split(':')[-1][:8]} {row['title']}"
+        label = _usage_label(row, by == "session" and bool(row.get("title")))
         for key in totals:
             totals[key] += row.get(key) or 0
         lines.append(
@@ -112,6 +126,37 @@ def _format_usage(rows: list[dict], by: str) -> str:
         f"  {_tokens(totals['output_tokens']):>8}"
         f"  {_tokens(totals['cache_write_tokens']):>8}"
         f"  {_tokens(totals['cache_read_tokens']):>9}"
+    )
+    return "\n".join(lines)
+
+
+def _format_tool_tokens(rows: list[dict], tool: str | None) -> str:
+    width = max((len(_usage_label(row, bool(tool))) for row in rows), default=8)
+    width = min(max(width, 10), 46)
+    heading = f"tool {tool}, by session" if tool else "tool"
+    lines = [
+        f"\n💠 Token cost by {heading}\n",
+        f"  {'':{width}}  {'calls':>7}  {'write':>8}  {'inject':>9}"
+        f"  {'result':>9}",
+    ]
+    totals = dict.fromkeys(
+        ("calls", "write_tokens", "inject_tokens", "result_bytes"), 0
+    )
+    for row in rows:
+        for key in totals:
+            totals[key] += row.get(key) or 0
+        lines.append(
+            f"  {_usage_label(row, bool(tool))[:width]:{width}}"
+            f"  {row['calls'] or 0:>7,}"
+            f"  {_tokens(row['write_tokens']):>8}"
+            f"  {_tokens(row['inject_tokens']):>9}"
+            f"  {_bytes(row['result_bytes']):>9}"
+        )
+    lines.append(
+        f"  {'TOTAL':{width}}  {totals['calls']:>7,}"
+        f"  {_tokens(totals['write_tokens']):>8}"
+        f"  {_tokens(totals['inject_tokens']):>9}"
+        f"  {_bytes(totals['result_bytes']):>9}"
     )
     return "\n".join(lines)
 
@@ -194,8 +239,13 @@ def main():
 
     command = subparsers.add_parser("usage", help="Token usage")
     command.add_argument(
-        "--by", choices=("model", "source", "project", "session", "agent", "day"),
+        "--by",
+        choices=("model", "source", "project", "session", "agent", "day", "tool"),
         default="model",
+    )
+    command.add_argument(
+        "--tool", metavar="NAME",
+        help="Break one tool down by session (implies --by tool)",
     )
     command.add_argument("--project")
     command.add_argument("--week", action="store_true")
@@ -399,6 +449,17 @@ def main():
                 )
                 print(f"  [{topic['source']:20s}] {timestamp}{exchange}")
                 print(f"                       {topic['topic']}\n")
+
+        elif args.command == "usage" and (args.tool or args.by == "tool"):
+            rows = searcher.tool_tokens(
+                tool=args.tool, source=args.source, project=args.project,
+                days=args.days, week=args.week, subagents=args.subagents,
+                limit=args.limit,
+            )
+            if not rows:
+                print("No tool usage recorded. Run: sessions index --backfill")
+                return
+            print(_format_tool_tokens(rows, args.tool))
 
         elif args.command == "usage":
             rows = searcher.usage(

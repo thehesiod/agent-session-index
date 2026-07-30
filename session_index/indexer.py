@@ -112,6 +112,22 @@ class SessionIndexer:
                     "ALTER TABLE session_usage "
                     "ADD COLUMN cache_write_5m_tokens INTEGER DEFAULT 0"
                 )
+            tool_columns = self._columns("session_tools")
+            if "write_tokens" not in tool_columns:
+                self.conn.execute(
+                    "ALTER TABLE session_tools "
+                    "ADD COLUMN write_tokens INTEGER DEFAULT 0"
+                )
+            if "inject_tokens" not in tool_columns:
+                self.conn.execute(
+                    "ALTER TABLE session_tools "
+                    "ADD COLUMN inject_tokens INTEGER DEFAULT 0"
+                )
+            if "result_bytes" not in tool_columns:
+                self.conn.execute(
+                    "ALTER TABLE session_tools "
+                    "ADD COLUMN result_bytes INTEGER DEFAULT 0"
+                )
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.conn.commit()
         # After both paths: the column may have just been added above
@@ -165,6 +181,9 @@ class SessionIndexer:
                 session_id TEXT NOT NULL,
                 tool_name TEXT NOT NULL,
                 use_count INTEGER DEFAULT 0,
+                write_tokens INTEGER DEFAULT 0,
+                inject_tokens INTEGER DEFAULT 0,
+                result_bytes INTEGER DEFAULT 0,
                 PRIMARY KEY (session_source, session_id, tool_name),
                 FOREIGN KEY (session_source, session_id)
                     REFERENCES sessions(source, session_id) ON DELETE CASCADE
@@ -438,12 +457,20 @@ class SessionIndexer:
                 "DELETE FROM session_tools "
                 "WHERE session_source=? AND session_id=?", identity
             )
-            for tool, count in data["tools"].items():
+            tool_tokens = data.get("tool_tokens") or {}
+            for tool in set(data["tools"]) | set(tool_tokens):
+                counts = tool_tokens.get(tool) or {}
                 self.conn.execute("""
                     INSERT INTO session_tools (
-                        session_source, session_id, tool_name, use_count
-                    ) VALUES (?, ?, ?, ?)
-                """, (*identity, tool, count))
+                        session_source, session_id, tool_name, use_count,
+                        write_tokens, inject_tokens, result_bytes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    *identity, tool, data["tools"].get(tool, 0),
+                    counts.get("write_tokens", 0),
+                    counts.get("inject_tokens", 0),
+                    counts.get("result_bytes", 0),
+                ))
 
             self.conn.execute(
                 "DELETE FROM session_usage "

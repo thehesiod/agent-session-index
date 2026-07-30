@@ -22,6 +22,7 @@ from session_index.sources import (
     MAX_MESSAGE_CHARS,
     ClaudeSourceAdapter,
     CodexSourceAdapter,
+    _ToolTokens,
     _add_claude_usage,
     sanitize_text,
     strip_codex_injected_context,
@@ -711,13 +712,14 @@ class UsageTests(unittest.TestCase):
             for row in self.search.usage(by="model", source="claude")
         }
         row = rows["claude-test"]
-        self.assertEqual(row["calls"], 1)
-        self.assertEqual(row["input_tokens"], 5)
-        self.assertEqual(row["output_tokens"], 7)
-        self.assertEqual(row["cache_write_tokens"], 100)
+        self.assertEqual(row["calls"], 2)
+        self.assertEqual(row["input_tokens"], 10)
+        self.assertEqual(row["output_tokens"], 10)
+        # 100 with a 60/40 tier split, then 200 reported without one
+        self.assertEqual(row["cache_write_tokens"], 300)
         self.assertEqual(row["cache_write_1h_tokens"], 60)
         self.assertEqual(row["cache_write_5m_tokens"], 40)
-        self.assertEqual(row["cache_read_tokens"], 900)
+        self.assertEqual(row["cache_read_tokens"], 1800)
 
     def test_codex_usage_reports_uncached_input_and_reasoning(self):
         rows = {
@@ -742,6 +744,48 @@ class UsageTests(unittest.TestCase):
         bucket = totals["m"]
         self.assertEqual(bucket["cache_write_tokens"], 916)
         self.assertEqual(bucket["cache_write_1h_tokens"], 916)
+
+    def test_tool_tokens_attribute_write_and_injected_input(self):
+        rows = {
+            row["grouping"]: row
+            for row in self.search.tool_tokens(source="claude")
+        }
+        row = rows["Read"]
+        self.assertEqual(row["calls"], 1)
+        # output tokens of the call that emitted the tool_use
+        self.assertEqual(row["write_tokens"], 7)
+        # billed input grew 1005 -> 1105 with only this result in between
+        self.assertEqual(row["inject_tokens"], 100)
+        self.assertEqual(row["result_bytes"], 400)
+
+    def test_tool_tokens_by_session_when_one_tool_named(self):
+        rows = self.search.tool_tokens(tool="Read")
+        self.assertEqual([row["grouping"] for row in rows],
+                         ["claude:shared-session"])
+        self.assertEqual(rows[0]["inject_tokens"], 100)
+
+    def test_codex_tool_result_bytes_are_measured(self):
+        rows = {
+            row["grouping"]: row
+            for row in self.search.tool_tokens(source="codex")
+        }
+        self.assertGreater(rows["shell_command"]["result_bytes"], 0)
+        # codex reports no per-call token split, so only payload size is known
+        self.assertEqual(rows["shell_command"]["write_tokens"], 0)
+
+    def test_unlinked_tool_result_lands_under_unknown(self):
+        tokens = _ToolTokens()
+        tokens.assistant({"content": [], "usage": {
+            "input_tokens": 10, "output_tokens": 1,
+        }})
+        tokens.result({"content": [
+            {"type": "tool_result", "tool_use_id": "absent", "content": "y" * 50},
+        ]})
+        tokens.assistant({"content": [], "usage": {
+            "input_tokens": 60, "output_tokens": 1,
+        }})
+        self.assertEqual(tokens.totals["unknown"]["result_bytes"], 50)
+        self.assertEqual(tokens.totals["unknown"]["inject_tokens"], 50)
 
     def test_usage_groupings_and_rejects_unknown(self):
         for by in ("model", "source", "project", "session", "day"):

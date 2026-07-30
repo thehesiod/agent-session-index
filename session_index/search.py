@@ -246,6 +246,47 @@ class SessionSearch:
                subagents: str = "include") -> list[dict]:
         return self.find(limit=n, source=source, subagents=subagents)
 
+    def tool_tokens(self, tool: str | None = None, source: str | None = None,
+                    project: str | None = None, days: int | None = None,
+                    week: bool = False, subagents: str = "include",
+                    limit: int = 25) -> list[dict]:
+        """Token cost per tool, or per session when one tool is named."""
+        conditions = []
+        params: list = []
+        source_clause, source_params = self._source_condition(source)
+        conditions.append(source_clause)
+        conditions.append(self._subagent_condition(subagents))
+        params.extend(source_params)
+        if tool:
+            conditions.append("st.tool_name LIKE ?")
+            params.append(f"%{tool}%")
+        if project:
+            conditions.append("(s.project_name LIKE ? OR s.project LIKE ?)")
+            params.extend([f"%{project}%", f"%{project}%"])
+        if week or days:
+            conditions.append("s.start_time >= ?")
+            params.append(
+                (datetime.now() - timedelta(days=days or 7)).isoformat()
+            )
+        params.append(limit)
+        grouping = "s.source || ':' || s.session_id" if tool else "st.tool_name"
+        statement = (
+            "SELECT " + grouping + " AS grouping, "
+            "MAX(s.title_display) AS title, "
+            "COUNT(DISTINCT s.source || ':' || s.session_id) AS sessions, "
+            "SUM(st.use_count) AS calls, "
+            "SUM(st.write_tokens) AS write_tokens, "
+            "SUM(st.inject_tokens) AS inject_tokens, "
+            "SUM(st.result_bytes) AS result_bytes "
+            "FROM session_tools st "
+            "JOIN sessions s ON s.source = st.session_source "
+            "AND s.session_id = st.session_id "
+            "WHERE " + " AND ".join(conditions) + " "
+            "GROUP BY grouping HAVING grouping IS NOT NULL "
+            "ORDER BY inject_tokens DESC, calls DESC LIMIT ?"
+        )
+        return [dict(row) for row in self.conn.execute(statement, params)]
+
     def usage(self, by: str = "model", source: str | None = None,
               project: str | None = None, days: int | None = None,
               week: bool = False, subagents: str = "include",

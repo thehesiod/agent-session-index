@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.4
+
+- Attribute token cost to individual tools. `session_tools` gains `write_tokens`,
+  `inject_tokens`, and `result_bytes`; `sessions usage --by tool` splits the bill across
+  tools and `--tool <name>` breaks one tool down by session. `tool_use_id` links a call
+  to its result exactly, so no estimation is involved.
+- `inject_tokens` is the billed input growth between consecutive calls, split across the
+  results that arrived in between in proportion to payload size. Growth with no
+  intervening result is left unattributed, and a result whose call is absent from the
+  transcript lands under `unknown`, rather than either being smeared across real tools.
+
+
 ## 0.4.3
 
 - Add `sessions usage`: per-session, per-model token counts captured during the existing

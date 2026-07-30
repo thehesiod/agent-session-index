@@ -179,6 +179,89 @@ def _add_claude_usage(totals: dict, model: str | None, usage) -> None:
     bucket["cache_read_tokens"] += usage.get("cache_read_input_tokens") or 0
 
 
+TOOL_TOKEN_FIELDS = ("write_tokens", "inject_tokens", "result_bytes")
+
+
+def _tool_result_size(value) -> int:
+    if isinstance(value, str):
+        return len(value)
+    if isinstance(value, list):
+        return sum(
+            len(part.get("text") or "") if isinstance(part, dict) else len(str(part))
+            for part in value
+        )
+    return len(str(value or ""))
+
+
+class _ToolTokens:
+    """Attribute token cost to individual tools within one transcript.
+
+    write_tokens are the output tokens of the call that emitted a tool_use,
+    split across the tools it emitted. inject_tokens are the billed input growth
+    between consecutive calls, split across the results that arrived in between
+    in proportion to payload size. A result whose call is not in this file lands
+    under "unknown" rather than being smeared across the known tools.
+    """
+
+    def __init__(self):
+        self.totals: dict[str, dict[str, int]] = {}
+        self._pending: dict[str, str] = {}
+        self._since_call: list[tuple[str, int]] = []
+        self._context: int | None = None
+
+    def bucket(self, name: str) -> dict:
+        return self.totals.setdefault(name, dict.fromkeys(TOOL_TOKEN_FIELDS, 0))
+
+    def _attribute_growth(self, context: int) -> None:
+        if self._context is not None and self._since_call:
+            delta = max(0, context - self._context)
+            total = sum(size for _, size in self._since_call) or 1
+            for name, size in self._since_call:
+                self.bucket(name)["inject_tokens"] += delta * size // total
+        self._context = context
+        self._since_call = []
+
+    def assistant(self, message: dict) -> None:
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else []
+        usage = message.get("usage")
+        if isinstance(usage, dict):
+            self._attribute_growth(
+                (usage.get("input_tokens") or 0)
+                + (usage.get("cache_creation_input_tokens") or 0)
+                + (usage.get("cache_read_input_tokens") or 0)
+            )
+            emitted = [
+                block.get("name") or "unknown" for block in blocks
+                if isinstance(block, dict) and block.get("type") == "tool_use"
+            ]
+            if emitted:
+                share = (usage.get("output_tokens") or 0) // len(emitted)
+                for name in emitted:
+                    self.bucket(name)["write_tokens"] += share
+        for block in blocks:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                self._pending[block.get("id")] = block.get("name") or "unknown"
+
+    def result(self, message: dict) -> None:
+        content = message.get("content")
+        for block in content if isinstance(content, list) else []:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            name = self._pending.pop(block.get("tool_use_id"), "unknown")
+            size = _tool_result_size(block.get("content"))
+            self.bucket(name)["result_bytes"] += size
+            self._since_call.append((name, size))
+
+    def record_call(self, call_id: str | None, name: str) -> None:
+        if call_id:
+            self._pending[call_id] = name
+
+    def record_output(self, call_id: str | None, output) -> None:
+        name = self._pending.pop(call_id, "unknown")
+        self.bucket(name)["result_bytes"] += _tool_result_size(output)
+
+
 def _codex_usage(model: str | None, totals: dict, turns: int) -> dict:
     """Normalize a codex rollout total onto the claude convention.
 
@@ -389,6 +472,7 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
         title = title_display = tags = None
         parent_session_id = agent_name = None
         usage: dict[str, dict[str, int]] = {}
+        tool_tokens = _ToolTokens()
 
         for entry in _read_jsonl(path):
             entry_type = entry.get("type")
@@ -437,8 +521,11 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
                     _add_claude_usage(
                         usage, message.get("model"), message.get("usage")
                     )
-                elif text and not _looks_like_system_prompt(text):
-                    user_prompts.append(text)
+                    tool_tokens.assistant(message)
+                else:
+                    tool_tokens.result(message)
+                    if text and not _looks_like_system_prompt(text):
+                        user_prompts.append(text)
                 if text and not (
                     entry_type == "user" and _looks_like_system_prompt(text)
                 ):
@@ -495,6 +582,7 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
             "has_compaction": int(bool(summaries)),
             "metadata_json": json.dumps({"format": "claude-code"}, sort_keys=True),
             "tools": tools,
+            "tool_tokens": tool_tokens.totals,
             "agents": agents,
             "usage": usage,
             "fts_content": _build_fts(fts_messages),
@@ -558,6 +646,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
         best_usage: dict = {}
         turns = 0
         previous_turn = None
+        tool_tokens = _ToolTokens()
 
         for entry in _read_jsonl(path):
             timestamp = entry.get("timestamp")
@@ -617,9 +706,14 @@ class CodexSourceAdapter(SessionSourceAdapter):
                     if name:
                         call_id = payload.get("call_id") or f"anon-{len(codex_calls)}"
                         codex_calls.setdefault(call_id, name)
+                        tool_tokens.record_call(payload.get("call_id"), name)
                     agent = _tool_agent_name(payload)
                     if agent:
                         agents[agent] = agents.get(agent, 0) + 1
+                elif isinstance(item_type, str) and item_type.endswith("_output"):
+                    tool_tokens.record_output(
+                        payload.get("call_id"), payload.get("output")
+                    )
                 # reasoning, tool outputs, and developer/system messages are
                 # intentionally excluded.
             elif (
@@ -709,6 +803,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
             "has_compaction": int(saw_compaction),
             "metadata_json": json.dumps(metadata, sort_keys=True),
             "tools": tools,
+            "tool_tokens": tool_tokens.totals,
             "agents": agents,
             "usage": _codex_usage(model, best_usage, turns),
             "fts_content": _build_fts(fts_messages),
