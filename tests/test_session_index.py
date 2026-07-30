@@ -17,7 +17,7 @@ from session_index.analyzer import (
     synthesize,
 )
 from session_index.indexer import SCHEMA_VERSION, SessionIndexer
-from session_index.search import SessionSearch
+from session_index.search import SessionSearch, format_result
 from session_index.sources import (
     MAX_MESSAGE_CHARS,
     ClaudeSourceAdapter,
@@ -554,6 +554,137 @@ class ConfigTests(unittest.TestCase):
                 sources["codex"]["root"], "/tmp/custom-codex"
             )
             self.assertTrue(sources["codex"]["enabled"])
+
+
+class SubagentTests(unittest.TestCase):
+    def test_subagent_transcript_is_indexed_under_its_parent(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            subagents = root / "-demo-project" / "parent-session" / "subagents"
+            subagents.mkdir(parents=True)
+            (subagents / "agent-abc123.jsonl").write_text("".join(
+                json.dumps(record) + "\n" for record in (
+                    {
+                        "type": "user",
+                        "isSidechain": True,
+                        "sessionId": "parent-session",
+                        "message": {"role": "user", "content": "find the leak"},
+                        "timestamp": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "type": "assistant",
+                        "isSidechain": True,
+                        "sessionId": "parent-session",
+                        "attributionAgent": "Explore",
+                        "message": {"role": "assistant", "content": [
+                            {"type": "text", "text": "found viridian-needle"},
+                        ], "model": "claude-test", "usage": {
+                            "input_tokens": 11,
+                            "output_tokens": 22,
+                            "cache_read_input_tokens": 33,
+                        }},
+                        "timestamp": "2026-01-01T00:01:00Z",
+                    },
+                )
+            ))
+
+            indexer = SessionIndexer(
+                db_path=Path(tempdir) / "sessions.db",
+                source_configs={
+                    "claude": {"enabled": True, "root": str(root)},
+                    "codex": {"enabled": False, "root": str(CODEX_ROOT)},
+                },
+            )
+            indexer.connect()
+            try:
+                stats = indexer.backfill_all(progress_interval=0)
+                row = indexer.conn.execute(
+                    "SELECT parent_session_id, agent_name, project "
+                    "FROM sessions WHERE session_id='agent-abc123'"
+                ).fetchone()
+            finally:
+                indexer.close()
+
+            self.assertEqual(stats["indexed"], 1)
+            self.assertEqual(row["parent_session_id"], "parent-session")
+            self.assertEqual(row["agent_name"], "Explore")
+            self.assertEqual(row["project"], "-demo-project")
+
+            search = SessionSearch(db_path=Path(tempdir) / "sessions.db")
+            search.connect()
+            try:
+                results = search.search("viridian-needle")
+            finally:
+                search.close()
+
+            self.assertEqual(len(results), 1)
+            rendered = format_result(results[0])
+            self.assertIn("[claude/subagent]", rendered)
+            self.assertIn("agent Explore", rendered)
+            self.assertIn("claude --resume parent-session", rendered)
+
+    def test_subagent_mode_filters_search_and_find(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            project = root / "-demo-project"
+            subagents = project / "parent-session" / "subagents"
+            subagents.mkdir(parents=True)
+            for path, needle in (
+                (project / "parent-session.jsonl", "cobalt-needle"),
+                (subagents / "agent-abc123.jsonl", "viridian-needle"),
+            ):
+                record = {
+                    "type": "user",
+                    "message": {"role": "user", "content": f"{needle} shared"},
+                    "timestamp": "2026-01-01T00:00:00Z",
+                }
+                if "subagents" in path.parts:
+                    record["isSidechain"] = True
+                    record["sessionId"] = "parent-session"
+                path.write_text(json.dumps(record) + "\n")
+
+            db_path = Path(tempdir) / "sessions.db"
+            indexer = SessionIndexer(
+                db_path=db_path,
+                source_configs={
+                    "claude": {"enabled": True, "root": str(root)},
+                    "codex": {"enabled": False, "root": str(CODEX_ROOT)},
+                },
+            )
+            indexer.connect()
+            try:
+                indexer.backfill_all(progress_interval=0)
+            finally:
+                indexer.close()
+
+            search = SessionSearch(db_path=db_path)
+            search.connect()
+            try:
+                modes = {
+                    mode: {
+                        row["session_id"]
+                        for row in search.search("shared", subagents=mode)
+                    }
+                    for mode in ("include", "exclude", "only")
+                }
+                found = {
+                    mode: {
+                        row["session_id"]
+                        for row in search.find(subagents=mode)
+                    }
+                    for mode in ("include", "exclude", "only")
+                }
+                with self.assertRaises(ValueError):
+                    search.search("shared", subagents="sometimes")
+            finally:
+                search.close()
+
+            for result in (modes, found):
+                self.assertEqual(
+                    result["include"], {"parent-session", "agent-abc123"}
+                )
+                self.assertEqual(result["exclude"], {"parent-session"})
+                self.assertEqual(result["only"], {"agent-abc123"})
 
 
 class LongSessionTests(unittest.TestCase):

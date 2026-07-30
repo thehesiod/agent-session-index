@@ -74,6 +74,11 @@ sessions tools --source codex
 sessions stats
 sessions stats --source claude
 
+# Subagent transcripts are indexed and searchable; control whether they surface
+sessions "needle" --subagents exclude
+sessions "needle" --subagents only
+sessions find --project ns --subagents only
+
 # Index all enabled sources, or one source
 sessions index
 sessions index --backfill

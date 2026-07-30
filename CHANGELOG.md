@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.2
+
+- Index subagent transcripts. `discover()` globbed one directory level, so every
+  `<project>/<session>/subagents/agent-*.jsonl` was invisible: 1,354 files, 468MB, and
+  21% of all recorded API calls. Their findings were unsearchable even though the parent
+  conversation only summarized them.
+- Record `parent_session_id` and `agent_name` on each session. A subagent transcript is
+  not resumable, so search labels it `[claude/subagent]`, shows which agent ran, and
+  prints the parent's resume command.
+- Add `--subagents include|exclude|only` to `search`, `find`, and `recent`, and report
+  the subagent count separately in `stats` so session totals stay readable.
+
 ## 0.4.1
 
 - Raise the per-session FTS cap from 100K to 8M characters. Tool output is already

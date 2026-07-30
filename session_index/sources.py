@@ -306,12 +306,20 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
             path
             for project_dir in self.root.iterdir()
             if project_dir.is_dir()
-            for path in project_dir.glob("*.jsonl")
+            for pattern in ("*.jsonl", "*/subagents/*.jsonl")
+            for path in project_dir.glob(pattern)
         )
+
+    def _project(self, path: Path) -> str:
+        # Subagent transcripts sit two levels deeper, under <session>/subagents/
+        try:
+            return path.relative_to(self.root).parts[0]
+        except ValueError:
+            return path.parent.name
 
     def parse(self, path: Path) -> Optional[dict]:
         session_id = path.stem
-        project = path.parent.name
+        project = self._project(path)
         project_name = self.project_names.get(project, project)
         user_prompts: list[str] = []
         fts_messages: list[str] = []
@@ -321,6 +329,7 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
         exchange_count = 0
         start_time = end_time = model = cwd = None
         title = title_display = tags = None
+        parent_session_id = agent_name = None
 
         for entry in _read_jsonl(path):
             entry_type = entry.get("type")
@@ -329,6 +338,12 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
                 start_time = start_time or timestamp
                 end_time = timestamp
             cwd = cwd or entry.get("cwd")
+            if entry.get("isSidechain"):
+                if not parent_session_id and entry.get("sessionId") != session_id:
+                    parent_session_id = entry.get("sessionId")
+                agent_name = agent_name or sanitize_text(
+                    entry.get("attributionAgent", ""), 200
+                ) or None
 
             if entry_type == "custom-title":
                 title_display = sanitize_text(entry.get("customTitle", ""), 500)
@@ -386,6 +401,8 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
         elif not title_display:
             title_display = _pick_title(user_prompts)
             title = title_display
+        if not title_display and agent_name:
+            title = title_display = f"{agent_name} subagent"
 
         topics = [{
             "topic": summary[:120],
@@ -397,6 +414,8 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
         return {
             "source": self.source,
             "session_id": session_id,
+            "parent_session_id": parent_session_id,
+            "agent_name": agent_name,
             "project": project,
             "project_name": project_name,
             "cwd": cwd,

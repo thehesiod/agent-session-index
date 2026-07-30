@@ -44,6 +44,14 @@ def _add_source(parser):
     )
 
 
+def _add_subagents(parser):
+    parser.add_argument(
+        "--subagents", choices=("include", "exclude", "only"),
+        default="include",
+        help="Whether subagent transcripts take part (default: include)",
+    )
+
+
 def _print_inline_context(result: dict, query: str, db_path: Path):
     context = get_context(
         result["session_id"], query=query, limit=3, db_path=db_path,
@@ -91,6 +99,7 @@ def main():
     command.add_argument("-n", "--limit", type=int, default=20)
     command.add_argument("--context", action="store_true")
     _add_source(command)
+    _add_subagents(command)
 
     command = subparsers.add_parser("context", help="Conversation context")
     command.add_argument("session_id", help="Session ID, prefix, or source:id")
@@ -115,6 +124,7 @@ def main():
     command = subparsers.add_parser("recent", help="Recent sessions")
     command.add_argument("n", nargs="?", type=int, default=10)
     _add_source(command)
+    _add_subagents(command)
 
     command = subparsers.add_parser("find", help="Filter sessions")
     command.add_argument("--client")
@@ -129,6 +139,7 @@ def main():
     command.add_argument("--compacted", action="store_true")
     command.add_argument("-n", "--limit", type=int, default=20)
     _add_source(command)
+    _add_subagents(command)
 
     command = subparsers.add_parser("tools", help="Tool usage")
     command.add_argument("tool_name", nargs="?")
@@ -240,7 +251,8 @@ def main():
     try:
         if args.command == "search":
             results = searcher.search(
-                args.query, limit=args.limit, source=args.source
+                args.query, limit=args.limit, source=args.source,
+                subagents=args.subagents,
             )
             if not results:
                 print(f"No results for: {args.query}")
@@ -253,7 +265,9 @@ def main():
                 print()
 
         elif args.command == "recent":
-            results = searcher.recent(args.n, source=args.source)
+            results = searcher.recent(
+                args.n, source=args.source, subagents=args.subagents
+            )
             _print_results(f"📋 Last {len(results)} sessions", results)
 
         elif args.command == "find":
@@ -264,6 +278,7 @@ def main():
                 exclude_project=args.exclude_project,
                 has_compaction=True if args.compacted else None,
                 limit=args.limit, source=args.source,
+                subagents=args.subagents,
             )
             if not results:
                 print("No sessions match those filters.")
@@ -335,7 +350,8 @@ def main():
             print("\n📊 Database overview")
             print("═" * 40)
             print(f"  Source:    {args.source or 'all'}")
-            print(f"  Sessions:  {stats.get('total_sessions', 0)}")
+            print(f"  Sessions:  {stats.get('total_sessions', 0)}"
+                  f" ({stats.get('total_subagents', 0)} subagent)")
             print(f"  Topics:    {stats.get('total_topics', 0)}")
             print(f"  Tools:     {stats.get('total_tools', 0)} distinct")
             print(f"  Agents:    {stats.get('total_agents', 0)} distinct")

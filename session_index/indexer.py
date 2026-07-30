@@ -18,7 +18,7 @@ except ImportError:
     import config
     from sources import build_adapters
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 VALID_SOURCES = ("claude", "codex")
 
 
@@ -99,14 +99,30 @@ class SessionIndexer:
                 self.conn.execute(
                     "ALTER TABLE sessions ADD COLUMN metadata_json TEXT"
                 )
+            if "parent_session_id" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT"
+                )
+            if "agent_name" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN agent_name TEXT"
+                )
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.conn.commit()
+        # After both paths: the column may have just been added above
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_parent "
+            "ON sessions(source, parent_session_id)"
+        )
+        self.conn.commit()
 
     def _create_v2_tables(self):
         statements = (
             """CREATE TABLE IF NOT EXISTS sessions (
                 source TEXT NOT NULL,
                 session_id TEXT NOT NULL,
+                parent_session_id TEXT,
+                agent_name TEXT,
                 project TEXT,
                 project_name TEXT,
                 cwd TEXT,
@@ -358,6 +374,7 @@ class SessionIndexer:
                 data["start_time"], data["end_time"], data["duration_minutes"],
                 data["model"], data["has_compaction"],
                 data.get("metadata_json"), now, now, data["file_hash"],
+                data.get("parent_session_id"), data.get("agent_name"),
             )
             self.conn.execute("""
                 INSERT INTO sessions (
@@ -365,11 +382,14 @@ class SessionIndexer:
                     title_display, tags, client, file_path, file_size,
                     exchange_count, start_time, end_time, duration_minutes,
                     model, has_compaction, metadata_json, indexed_at,
-                    last_modified, file_hash
+                    last_modified, file_hash, parent_session_id, agent_name
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?
                 )
                 ON CONFLICT(source, session_id) DO UPDATE SET
+                    parent_session_id=excluded.parent_session_id,
+                    agent_name=excluded.agent_name,
                     project=excluded.project,
                     project_name=excluded.project_name,
                     cwd=excluded.cwd,
@@ -553,6 +573,10 @@ class SessionIndexer:
             "total_agents": self.conn.execute(
                 "SELECT COUNT(DISTINCT agent_name) FROM session_agents"
                 + (" WHERE session_source=?" if source else ""), params
+            ).fetchone()[0],
+            "total_subagents": self.conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE parent_session_id IS NOT NULL"
+                + (" AND source=?" if source else ""), params
             ).fetchone()[0],
         }
         rows = self.conn.execute(

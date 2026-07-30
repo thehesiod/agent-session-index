@@ -13,6 +13,7 @@ except ImportError:
     import config
 
 VALID_SOURCES = ("claude", "codex")
+SUBAGENT_MODES = ("include", "exclude", "only")
 
 
 def _escape_fts_query(query: str) -> str:
@@ -86,11 +87,24 @@ class SessionSearch:
             raise ValueError(f"Unknown source: {source}")
         return (f"{alias}.source = ?", [source]) if source else ("1=1", [])
 
+    @staticmethod
+    def _subagent_condition(subagents: str = "include", alias: str = "s") -> str:
+        if subagents not in SUBAGENT_MODES:
+            raise ValueError(f"Unknown subagent mode: {subagents}")
+        if subagents == "exclude":
+            return f"{alias}.parent_session_id IS NULL"
+        if subagents == "only":
+            return f"{alias}.parent_session_id IS NOT NULL"
+        return "1=1"
+
     def search(self, query: str, limit: int = 20,
-               source: str | None = None) -> list[dict]:
+               source: str | None = None,
+               subagents: str = "include") -> list[dict]:
         source_clause, source_params = self._source_condition(source)
+        subagent_clause = self._subagent_condition(subagents)
         rows = self.conn.execute(f"""
-            SELECT s.source, s.session_id, s.project_name, s.title,
+            SELECT s.source, s.session_id, s.parent_session_id, s.agent_name,
+                   s.project_name, s.title,
                    s.title_display, s.client, s.tags, s.exchange_count,
                    s.start_time, s.duration_minutes, s.has_compaction,
                    snippet(session_content, 2, '>>>', '<<<', '...', 40)
@@ -100,6 +114,7 @@ class SessionSearch:
               ON s.source = session_content.source
              AND s.session_id = session_content.session_id
             WHERE session_content MATCH ? AND {source_clause}
+              AND {subagent_clause}
             ORDER BY rank
             LIMIT ?
         """, [_escape_fts_query(query), *source_params, limit]).fetchall()
@@ -119,11 +134,13 @@ class SessionSearch:
         has_compaction: bool = None,
         limit: int = 20,
         source: str | None = None,
+        subagents: str = "include",
     ) -> list[dict]:
         conditions = []
         params = []
         source_clause, source_params = self._source_condition(source)
         conditions.append(source_clause)
+        conditions.append(self._subagent_condition(subagents))
         params.extend(source_params)
         if client:
             conditions.append("s.client LIKE ?")
@@ -176,7 +193,8 @@ class SessionSearch:
 
         params.append(limit)
         rows = self.conn.execute(f"""
-            SELECT s.source, s.session_id, s.project_name, s.title,
+            SELECT s.source, s.session_id, s.parent_session_id, s.agent_name,
+                   s.project_name, s.title,
                    s.title_display, s.client, s.tags, s.exchange_count,
                    s.start_time, s.duration_minutes, s.has_compaction
             FROM sessions s
@@ -216,9 +234,9 @@ class SessionSearch:
         """, (resolved["source"], resolved["session_id"])).fetchall()
         return [dict(row) for row in rows]
 
-    def recent(self, n: int = 10,
-               source: str | None = None) -> list[dict]:
-        return self.find(limit=n, source=source)
+    def recent(self, n: int = 10, source: str | None = None,
+               subagents: str = "include") -> list[dict]:
+        return self.find(limit=n, source=source, subagents=subagents)
 
     def stats(self, source: str | None = None) -> dict:
         try:
@@ -289,14 +307,18 @@ class SessionSearch:
 def format_result(result: dict, show_topics: bool = True) -> str:
     lines = []
     source = result.get("source", "claude")
-    short_id = result["session_id"][:8]
+    # Every subagent id starts with "agent-", leaving only 2 distinguishing chars
+    short_id = result["session_id"].removeprefix("agent-")[:8]
     title = (
         result.get("title_display") or result.get("title") or "(unnamed)"
     )
     if len(title) > 70:
         title = title[:67] + "..."
-    lines.append(f"  ◆ [{source}] {short_id} · {title}")
+    label = f"{source}/subagent" if result.get("parent_session_id") else source
+    lines.append(f"  ◆ [{label}] {short_id} · {title}")
     meta = []
+    if result.get("agent_name"):
+        meta.append(f"agent {result['agent_name']}")
     if result.get("start_time"):
         meta.append(result["start_time"][:10])
     if result.get("project_name"):
@@ -323,9 +345,9 @@ def format_result(result: dict, show_topics: bool = True) -> str:
             lines.append(f"    topics: {' → '.join(topics)}")
     if result.get("tags"):
         lines.append(f"    [{result['tags']}]")
-    lines.append(
-        f"    → {resume_command(source, result['session_id'])}"
-    )
+    # A subagent transcript is not resumable; its parent conversation is
+    resume_id = result.get("parent_session_id") or result["session_id"]
+    lines.append(f"    → {resume_command(source, resume_id)}")
     return "\n".join(lines)
 
 
