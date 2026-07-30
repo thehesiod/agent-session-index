@@ -14,6 +14,14 @@ except ImportError:
 
 VALID_SOURCES = ("claude", "codex")
 SUBAGENT_MODES = ("include", "exclude", "only")
+USAGE_GROUPINGS = {
+    "model": "u.model",
+    "source": "s.source",
+    "project": "s.project_name",
+    "session": "s.source || ':' || s.session_id",
+    "agent": "s.agent_name",
+    "day": "substr(s.start_time, 1, 10)",
+}
 
 
 def _escape_fts_query(query: str) -> str:
@@ -237,6 +245,48 @@ class SessionSearch:
     def recent(self, n: int = 10, source: str | None = None,
                subagents: str = "include") -> list[dict]:
         return self.find(limit=n, source=source, subagents=subagents)
+
+    def usage(self, by: str = "model", source: str | None = None,
+              project: str | None = None, days: int | None = None,
+              week: bool = False, subagents: str = "include",
+              limit: int = 25) -> list[dict]:
+        if by not in USAGE_GROUPINGS:
+            raise ValueError(f"Unknown grouping: {by}")
+        conditions = []
+        params: list = []
+        source_clause, source_params = self._source_condition(source)
+        conditions.append(source_clause)
+        conditions.append(self._subagent_condition(subagents))
+        params.extend(source_params)
+        if project:
+            conditions.append("(s.project_name LIKE ? OR s.project LIKE ?)")
+            params.extend([f"%{project}%", f"%{project}%"])
+        if week or days:
+            conditions.append("s.start_time >= ?")
+            params.append(
+                (datetime.now() - timedelta(days=days or 7)).isoformat()
+            )
+        params.append(limit)
+        statement = (
+            "SELECT " + USAGE_GROUPINGS[by] + " AS grouping, "
+            "MAX(s.title_display) AS title, "
+            "COUNT(DISTINCT s.source || ':' || s.session_id) AS sessions, "
+            "SUM(u.calls) AS calls, "
+            "SUM(u.input_tokens) AS input_tokens, "
+            "SUM(u.output_tokens) AS output_tokens, "
+            "SUM(u.cache_write_tokens) AS cache_write_tokens, "
+            "SUM(u.cache_write_1h_tokens) AS cache_write_1h_tokens, "
+            "SUM(u.cache_write_5m_tokens) AS cache_write_5m_tokens, "
+            "SUM(u.cache_read_tokens) AS cache_read_tokens, "
+            "SUM(u.reasoning_tokens) AS reasoning_tokens "
+            "FROM session_usage u "
+            "JOIN sessions s ON s.source = u.session_source "
+            "AND s.session_id = u.session_id "
+            "WHERE " + " AND ".join(conditions) + " "
+            "GROUP BY grouping HAVING grouping IS NOT NULL "
+            "ORDER BY output_tokens DESC LIMIT ?"
+        )
+        return [dict(row) for row in self.conn.execute(statement, params)]
 
     def stats(self, source: str | None = None) -> dict:
         try:

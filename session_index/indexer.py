@@ -107,6 +107,11 @@ class SessionIndexer:
                 self.conn.execute(
                     "ALTER TABLE sessions ADD COLUMN agent_name TEXT"
                 )
+            if "cache_write_5m_tokens" not in self._columns("session_usage"):
+                self.conn.execute(
+                    "ALTER TABLE session_usage "
+                    "ADD COLUMN cache_write_5m_tokens INTEGER DEFAULT 0"
+                )
             self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self.conn.commit()
         # After both paths: the column may have just been added above
@@ -173,6 +178,22 @@ class SessionIndexer:
                 FOREIGN KEY (session_source, session_id)
                     REFERENCES sessions(source, session_id) ON DELETE CASCADE
             )""",
+            """CREATE TABLE IF NOT EXISTS session_usage (
+                session_source TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                calls INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                cache_write_1h_tokens INTEGER DEFAULT 0,
+                cache_write_5m_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                PRIMARY KEY (session_source, session_id, model),
+                FOREIGN KEY (session_source, session_id)
+                    REFERENCES sessions(source, session_id) ON DELETE CASCADE
+            )""",
             """CREATE TABLE IF NOT EXISTS index_state (
                 source TEXT PRIMARY KEY,
                 initialized_at TEXT NOT NULL
@@ -181,6 +202,7 @@ class SessionIndexer:
             "CREATE INDEX IF NOT EXISTS idx_sessions_client ON sessions(client)",
             "CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_time)",
             "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
+            "CREATE INDEX IF NOT EXISTS idx_usage_model ON session_usage(model)",
             "CREATE INDEX IF NOT EXISTS idx_topics_session "
             "ON session_topics(session_source, session_id)",
             "CREATE INDEX IF NOT EXISTS idx_topics_source ON session_topics(source)",
@@ -422,6 +444,27 @@ class SessionIndexer:
                         session_source, session_id, tool_name, use_count
                     ) VALUES (?, ?, ?, ?)
                 """, (*identity, tool, count))
+
+            self.conn.execute(
+                "DELETE FROM session_usage "
+                "WHERE session_source=? AND session_id=?", identity
+            )
+            for model, counts in (data.get("usage") or {}).items():
+                self.conn.execute("""
+                    INSERT INTO session_usage (
+                        session_source, session_id, model, calls,
+                        input_tokens, output_tokens, cache_write_tokens,
+                        cache_write_1h_tokens, cache_write_5m_tokens,
+                        cache_read_tokens, reasoning_tokens
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    *identity, model, counts["calls"],
+                    counts["input_tokens"], counts["output_tokens"],
+                    counts["cache_write_tokens"],
+                    counts["cache_write_1h_tokens"],
+                    counts["cache_write_5m_tokens"],
+                    counts["cache_read_tokens"], counts["reasoning_tokens"],
+                ))
 
             self.conn.execute(
                 "DELETE FROM session_agents "

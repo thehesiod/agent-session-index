@@ -33,7 +33,7 @@ except ImportError:
 SOURCES = ("claude", "codex")
 SUBCOMMANDS = {
     "context", "analytics", "synthesize", "recent", "find",
-    "tools", "topics", "stats", "index", "search",
+    "tools", "topics", "stats", "index", "search", "usage",
 }
 
 
@@ -71,6 +71,49 @@ def _print_inline_context(result: dict, query: str, db_path: Path):
         print(f"    │ 🧑 {user}")
         print(f"    │ 🤖 {assistant}")
         print(f"    └{'─' * 42}")
+
+
+def _tokens(value: int | None) -> str:
+    value = value or 0
+    for limit, suffix in ((1_000_000_000, "B"), (1_000_000, "M"), (1_000, "K")):
+        if value >= limit:
+            return f"{value / limit:.1f}{suffix}"
+    return str(value)
+
+
+def _format_usage(rows: list[dict], by: str) -> str:
+    width = max((len(str(row["grouping"] or "")) for row in rows), default=8)
+    width = min(max(width, 8), 46)
+    lines = [
+        f"\n💠 Token usage by {by}\n",
+        f"  {'':{width}}  {'calls':>7}  {'in':>8}  {'out':>8}"
+        f"  {'cache w':>8}  {'cache r':>9}",
+    ]
+    totals = dict.fromkeys(
+        ("calls", "input_tokens", "output_tokens",
+         "cache_write_tokens", "cache_read_tokens"), 0
+    )
+    for row in rows:
+        label = str(row["grouping"] or "unknown")
+        if by == "session" and row.get("title"):
+            label = f"{label.split(':')[-1][:8]} {row['title']}"
+        for key in totals:
+            totals[key] += row.get(key) or 0
+        lines.append(
+            f"  {label[:width]:{width}}  {row['calls'] or 0:>7,}"
+            f"  {_tokens(row['input_tokens']):>8}"
+            f"  {_tokens(row['output_tokens']):>8}"
+            f"  {_tokens(row['cache_write_tokens']):>8}"
+            f"  {_tokens(row['cache_read_tokens']):>9}"
+        )
+    lines.append(
+        f"  {'TOTAL':{width}}  {totals['calls']:>7,}"
+        f"  {_tokens(totals['input_tokens']):>8}"
+        f"  {_tokens(totals['output_tokens']):>8}"
+        f"  {_tokens(totals['cache_write_tokens']):>8}"
+        f"  {_tokens(totals['cache_read_tokens']):>9}"
+    )
+    return "\n".join(lines)
 
 
 def _print_results(title: str, results: list[dict]):
@@ -148,6 +191,18 @@ def main():
     command = subparsers.add_parser("topics", help="Topic timeline")
     command.add_argument("session_id")
     _add_source(command)
+
+    command = subparsers.add_parser("usage", help="Token usage")
+    command.add_argument(
+        "--by", choices=("model", "source", "project", "session", "agent", "day"),
+        default="model",
+    )
+    command.add_argument("--project")
+    command.add_argument("--week", action="store_true")
+    command.add_argument("--days", type=int)
+    command.add_argument("-n", "--limit", type=int, default=25)
+    _add_source(command)
+    _add_subagents(command)
 
     command = subparsers.add_parser("stats", help="Database overview")
     _add_source(command)
@@ -344,6 +399,17 @@ def main():
                 )
                 print(f"  [{topic['source']:20s}] {timestamp}{exchange}")
                 print(f"                       {topic['topic']}\n")
+
+        elif args.command == "usage":
+            rows = searcher.usage(
+                by=args.by, source=args.source, project=args.project,
+                days=args.days, week=args.week, subagents=args.subagents,
+                limit=args.limit,
+            )
+            if not rows:
+                print("No usage recorded. Run: sessions index --backfill")
+                return
+            print(_format_usage(rows, args.by))
 
         elif args.command == "stats":
             stats = searcher.stats(args.source)

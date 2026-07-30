@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.3
+
+- Add `sessions usage`: per-session, per-model token counts captured during the existing
+  parse pass, grouped by model, source, project, session, agent, or day. Both sources
+  are normalized so `input_tokens` means uncached input and billed input is
+  `input + cache_read + cache_write`.
+- Record claude's 1h and 5m cache-write tiers separately, since they bill at different
+  multipliers. `cache_write_tokens` takes the larger of the reported total and the sum
+  of the tiers, because some entries report a zero total beside a nonzero tier.
+- Discover subagent transcripts at any depth. Workflow agents live under
+  `subagents/workflows/<id>/`, and some sessions nest a duplicate session directory;
+  the previous single-level glob missed 329 files.
+
+
 ## 0.4.2
 
 - Index subagent transcripts. `discover()` globbed one directory level, so every

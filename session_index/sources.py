@@ -146,6 +146,63 @@ def _detect_client(clients: list[str], prompts: list[str], project_name: str) ->
     return next((client for client in clients if client.lower() in haystack), None)
 
 
+USAGE_FIELDS = (
+    "calls", "input_tokens", "output_tokens", "cache_write_tokens",
+    "cache_write_1h_tokens", "cache_write_5m_tokens", "cache_read_tokens",
+    "reasoning_tokens",
+)
+
+
+def _usage_bucket(totals: dict, model: str | None) -> dict:
+    return totals.setdefault(
+        sanitize_text(model or "", 100) or "unknown",
+        dict.fromkeys(USAGE_FIELDS, 0),
+    )
+
+
+def _add_claude_usage(totals: dict, model: str | None, usage) -> None:
+    if not isinstance(usage, dict):
+        return
+    bucket = _usage_bucket(totals, model)
+    creation = usage.get("cache_creation") or {}
+    tier_1h = creation.get("ephemeral_1h_input_tokens") or 0
+    tier_5m = creation.get("ephemeral_5m_input_tokens") or 0
+    bucket["calls"] += 1
+    bucket["input_tokens"] += usage.get("input_tokens") or 0
+    bucket["output_tokens"] += usage.get("output_tokens") or 0
+    # Some entries report cache_creation_input_tokens=0 alongside a nonzero tier
+    bucket["cache_write_tokens"] += max(
+        usage.get("cache_creation_input_tokens") or 0, tier_1h + tier_5m
+    )
+    bucket["cache_write_1h_tokens"] += tier_1h
+    bucket["cache_write_5m_tokens"] += tier_5m
+    bucket["cache_read_tokens"] += usage.get("cache_read_input_tokens") or 0
+
+
+def _codex_usage(model: str | None, totals: dict, turns: int) -> dict:
+    """Normalize a codex rollout total onto the claude convention.
+
+    Codex counts cached and cache-written tokens inside input_tokens; claude
+    reports them alongside it. Subtract so input_tokens means uncached input in
+    both sources and billed input stays input + cache_read + cache_write.
+    """
+    if not totals:
+        return {}
+    cached = totals.get("cached_input_tokens") or 0
+    written = totals.get("cache_write_input_tokens") or 0
+    usage: dict[str, dict[str, int]] = {}
+    bucket = _usage_bucket(usage, model)
+    bucket["calls"] = turns
+    bucket["input_tokens"] = max(
+        0, (totals.get("input_tokens") or 0) - cached - written
+    )
+    bucket["output_tokens"] = totals.get("output_tokens") or 0
+    bucket["cache_write_tokens"] = written
+    bucket["cache_read_tokens"] = cached
+    bucket["reasoning_tokens"] = totals.get("reasoning_output_tokens") or 0
+    return usage
+
+
 def _build_fts(messages: list[str]) -> str:
     content = "\n".join(part for part in messages if part)
     return content[:MAX_FTS_CHARS]
@@ -306,7 +363,8 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
             path
             for project_dir in self.root.iterdir()
             if project_dir.is_dir()
-            for pattern in ("*.jsonl", "*/subagents/*.jsonl")
+            # subagents/ nests at varying depths; pathlib.glob ignores symlinks
+            for pattern in ("*.jsonl", "**/subagents/**/*.jsonl")
             for path in project_dir.glob(pattern)
         )
 
@@ -330,6 +388,7 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
         start_time = end_time = model = cwd = None
         title = title_display = tags = None
         parent_session_id = agent_name = None
+        usage: dict[str, dict[str, int]] = {}
 
         for entry in _read_jsonl(path):
             entry_type = entry.get("type")
@@ -375,6 +434,9 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
                 )
                 if entry_type == "assistant":
                     model = model or message.get("model")
+                    _add_claude_usage(
+                        usage, message.get("model"), message.get("usage")
+                    )
                 elif text and not _looks_like_system_prompt(text):
                     user_prompts.append(text)
                 if text and not (
@@ -434,6 +496,7 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
             "metadata_json": json.dumps({"format": "claude-code"}, sort_keys=True),
             "tools": tools,
             "agents": agents,
+            "usage": usage,
             "fts_content": _build_fts(fts_messages),
             "topics": topics,
         }
@@ -491,6 +554,10 @@ class CodexSourceAdapter(SessionSourceAdapter):
         # one MCP call emits both a function_call and an mcp_tool_call_end; key by call_id
         codex_calls: dict[str, str] = {}
         event_messages: list[tuple[str, str]] = []
+        # total_token_usage is cumulative per rollout, so keep the largest record
+        best_usage: dict = {}
+        turns = 0
+        previous_turn = None
 
         for entry in _read_jsonl(path):
             timestamp = entry.get("timestamp")
@@ -571,6 +638,20 @@ class CodexSourceAdapter(SessionSourceAdapter):
                     event_messages.append((role, text))
             elif (
                 entry_type == "event_msg"
+                and payload.get("type") == "token_count"
+            ):
+                info = payload.get("info") or {}
+                totals = info.get("total_token_usage") or {}
+                if (totals.get("total_tokens") or 0) > (
+                    best_usage.get("total_tokens") or 0
+                ):
+                    best_usage = totals
+                turn = info.get("last_token_usage") or {}
+                if (turn.get("total_tokens") or 0) and turn != previous_turn:
+                    turns += 1
+                    previous_turn = turn
+            elif (
+                entry_type == "event_msg"
                 and payload.get("type") == "mcp_tool_call_end"
             ):
                 invocation = payload.get("invocation") or {}
@@ -629,6 +710,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
             "metadata_json": json.dumps(metadata, sort_keys=True),
             "tools": tools,
             "agents": agents,
+            "usage": _codex_usage(model, best_usage, turns),
             "fts_content": _build_fts(fts_messages),
             "topics": topics,
         }

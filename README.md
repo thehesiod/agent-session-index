@@ -79,6 +79,12 @@ sessions "needle" --subagents exclude
 sessions "needle" --subagents only
 sessions find --project ns --subagents only
 
+# Token usage, per session x model, from the same parse pass
+sessions usage
+sessions usage --by session -n 10
+sessions usage --by agent --week
+sessions usage --by day --days 30 --subagents exclude
+
 # Index all enabled sources, or one source
 sessions index
 sessions index --backfill
@@ -205,3 +211,23 @@ copyright and license notice are retained in [LICENSE](LICENSE).
 ## License
 
 MIT
+
+## Token usage
+
+`sessions usage` aggregates the token counts each transcript already records, so no
+extra pass over the transcripts is needed. Groupings: `model`, `source`, `project`,
+`session`, `agent`, `day`.
+
+Both sources are normalized onto one convention, where `input_tokens` counts uncached
+input only and billed input is `input_tokens + cache_read_tokens + cache_write_tokens`.
+Codex reports cached and cache-written tokens inside its `input_tokens`, so those are
+subtracted on the way in.
+
+Claude records the cache-write tiers separately, which cost different multipliers:
+`cache_write_1h_tokens` and `cache_write_5m_tokens`. `cache_write_tokens` never
+undercounts their sum, because some entries report a zero total beside a nonzero tier.
+
+Caveats. Codex reports one cumulative total per rollout rather than per call, so a
+codex session gets a single row under its last known model, and `calls` counts model
+turns rather than API calls. Sessions whose transcript was deleted keep their indexed
+text but have no usage rows.

@@ -22,6 +22,7 @@ from session_index.sources import (
     MAX_MESSAGE_CHARS,
     ClaudeSourceAdapter,
     CodexSourceAdapter,
+    _add_claude_usage,
     sanitize_text,
     strip_codex_injected_context,
 )
@@ -685,6 +686,75 @@ class SubagentTests(unittest.TestCase):
                 )
                 self.assertEqual(result["exclude"], {"parent-session"})
                 self.assertEqual(result["only"], {"agent-abc123"})
+
+
+class UsageTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tempdir.name) / "sessions.db"
+        indexer = SessionIndexer(
+            db_path=self.db_path, source_configs=source_configs()
+        )
+        indexer.connect()
+        indexer.backfill_all(progress_interval=0)
+        indexer.close()
+        self.search = SessionSearch(db_path=self.db_path)
+        self.search.connect()
+
+    def tearDown(self):
+        self.search.close()
+        self.tempdir.cleanup()
+
+    def test_claude_usage_splits_cache_tiers(self):
+        rows = {
+            row["grouping"]: row
+            for row in self.search.usage(by="model", source="claude")
+        }
+        row = rows["claude-test"]
+        self.assertEqual(row["calls"], 1)
+        self.assertEqual(row["input_tokens"], 5)
+        self.assertEqual(row["output_tokens"], 7)
+        self.assertEqual(row["cache_write_tokens"], 100)
+        self.assertEqual(row["cache_write_1h_tokens"], 60)
+        self.assertEqual(row["cache_write_5m_tokens"], 40)
+        self.assertEqual(row["cache_read_tokens"], 900)
+
+    def test_codex_usage_reports_uncached_input_and_reasoning(self):
+        rows = {
+            row["grouping"]: row
+            for row in self.search.usage(by="model", source="codex")
+        }
+        row = rows["gpt-test"]
+        # codex counts cached tokens inside input_tokens: 1000 - 700 - 50
+        self.assertEqual(row["input_tokens"], 250)
+        self.assertEqual(row["cache_read_tokens"], 700)
+        self.assertEqual(row["cache_write_tokens"], 50)
+        self.assertEqual(row["reasoning_tokens"], 30)
+        self.assertEqual(row["output_tokens"], 40)
+
+    def test_cache_write_total_never_undercounts_its_tiers(self):
+        # Real transcripts report cache_creation_input_tokens=0 beside a tier
+        totals = {}
+        _add_claude_usage(totals, "m", {
+            "cache_creation_input_tokens": 0,
+            "cache_creation": {"ephemeral_1h_input_tokens": 916},
+        })
+        bucket = totals["m"]
+        self.assertEqual(bucket["cache_write_tokens"], 916)
+        self.assertEqual(bucket["cache_write_1h_tokens"], 916)
+
+    def test_usage_groupings_and_rejects_unknown(self):
+        for by in ("model", "source", "project", "session", "day"):
+            self.assertTrue(self.search.usage(by=by))
+        with self.assertRaises(ValueError):
+            self.search.usage(by="wingspan")
+
+    def test_usage_rows_disappear_with_their_session(self):
+        self.search.conn.execute("PRAGMA foreign_keys=ON")
+        self.search.conn.execute(
+            "DELETE FROM sessions WHERE source='claude'"
+        )
+        self.assertEqual(self.search.usage(by="model", source="claude"), [])
 
 
 class LongSessionTests(unittest.TestCase):
