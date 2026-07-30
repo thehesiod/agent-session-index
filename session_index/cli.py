@@ -130,10 +130,16 @@ def _format_usage(rows: list[dict], by: str) -> str:
     return "\n".join(lines)
 
 
-def _format_tool_tokens(rows: list[dict], tool: str | None) -> str:
+def _format_tool_tokens(rows: list[dict], tool: str | None,
+                        command_of: str | None = None) -> str:
     width = max((len(_usage_label(row, bool(tool))) for row in rows), default=8)
     width = min(max(width, 10), 46)
-    heading = f"tool {tool}, by session" if tool else "tool"
+    if command_of:
+        heading = f"{command_of} command"
+    elif tool:
+        heading = f"tool {tool}, by session"
+    else:
+        heading = "tool"
     lines = [
         f"\n💠 Token cost by {heading}\n",
         f"  {'':{width}}  {'calls':>7}  {'write':>8}  {'inject':>9}"
@@ -240,7 +246,10 @@ def main():
     command = subparsers.add_parser("usage", help="Token usage")
     command.add_argument(
         "--by",
-        choices=("model", "source", "project", "session", "agent", "day", "tool"),
+        choices=(
+            "model", "source", "project", "session", "agent", "day", "tool",
+            "command",
+        ),
         default="model",
     )
     command.add_argument(
@@ -449,6 +458,17 @@ def main():
                 )
                 print(f"  [{topic['source']:20s}] {timestamp}{exchange}")
                 print(f"                       {topic['topic']}\n")
+
+        elif args.command == "usage" and args.by == "command":
+            rows = searcher.tool_detail(
+                tool=args.tool or "Bash", source=args.source,
+                project=args.project, days=args.days, week=args.week,
+                subagents=args.subagents, limit=args.limit,
+            )
+            if not rows:
+                print("No command detail recorded. Run: sessions index --backfill")
+                return
+            print(_format_tool_tokens(rows, None, args.tool or "Bash"))
 
         elif args.command == "usage" and (args.tool or args.by == "tool"):
             rows = searcher.tool_tokens(

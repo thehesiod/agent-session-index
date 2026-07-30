@@ -24,6 +24,8 @@ from session_index.sources import (
     CodexSourceAdapter,
     _ToolTokens,
     _add_claude_usage,
+    bash_command,
+    canonical_tool_name,
     sanitize_text,
     strip_codex_injected_context,
 )
@@ -787,11 +789,60 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(tokens.totals["unknown"]["result_bytes"], 50)
         self.assertEqual(tokens.totals["unknown"]["inject_tokens"], 50)
 
+    def test_bash_command_names_the_real_command(self):
+        cases = {
+            "cd /repo; sessions usage --by tool": "sessions",
+            "cd ~/repo && git -C ~/repo log --oneline": "git log",
+            "grep -rn foo . | head -20": "grep",
+            'echo "=== a ==="; sqlite3 db "select 1"': "sqlite3",
+            "AWS_PROFILE=eng aws s3 ls": "aws s3",
+            "sudo /usr/local/bin/docker compose down": "docker compose",
+            "cd /tmp": "cd",
+            "": "",
+        }
+        for command, expected in cases.items():
+            self.assertEqual(bash_command(command), expected, command)
+
+    def test_canonical_tool_name_collapses_mcp_spellings(self):
+        self.assertEqual(
+            canonical_tool_name("mcp__codegraph__codegraph_search"),
+            "codegraph.codegraph_search",
+        )
+        self.assertEqual(
+            canonical_tool_name("codegraph.codegraph_search"),
+            "codegraph.codegraph_search",
+        )
+        self.assertEqual(canonical_tool_name("Bash"), "Bash")
+
     def test_usage_groupings_and_rejects_unknown(self):
         for by in ("model", "source", "project", "session", "day"):
             self.assertTrue(self.search.usage(by=by))
         with self.assertRaises(ValueError):
             self.search.usage(by="wingspan")
+
+    def test_orphaned_child_rows_are_swept(self):
+        indexer = SessionIndexer(
+            db_path=self.db_path, source_configs=source_configs()
+        )
+        indexer.connect()
+        try:
+            indexer.conn.execute("PRAGMA foreign_keys=OFF")
+            indexer.conn.execute(
+                "INSERT INTO session_tools (session_source, session_id, "
+                "tool_name, use_count) VALUES ('claude', 'ghost', 'Bash', 99)"
+            )
+            indexer.conn.commit()
+            indexer._sweep_orphans()
+            remaining, = indexer.conn.execute(
+                "SELECT COUNT(*) FROM session_tools WHERE session_id='ghost'"
+            ).fetchone()
+            violations = indexer.conn.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+        finally:
+            indexer.close()
+        self.assertEqual(remaining, 0)
+        self.assertEqual(violations, [])
 
     def test_usage_rows_disappear_with_their_session(self):
         self.search.conn.execute("PRAGMA foreign_keys=ON")

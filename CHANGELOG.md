@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.5
+
+- Canonicalize MCP tool names to `<server>.<tool>`. Claude's `mcp__server__tool` and
+  codex's `server.tool` are the same tool, so per-tool totals were splitting across
+  sources; codegraph's 1,300 calls were spread over three spellings and looked absent.
+- Count a codex MCP call once. One call emits both a `function_call` response item and an
+  `mcp_tool_call_end` event with the same `call_id`, and both were counted, under
+  different names. Calls are now keyed by `call_id`, and the result bytes carried inline
+  on `mcp_tool_call_end` are measured instead of dropped.
+- Add `sessions usage --by command`, breaking Bash down by what it ran, in a new
+  `session_tool_detail` table. Leading `cd`/`echo` segments are skipped so the credited
+  command is the real one, and only the first command of a chain is credited so the
+  breakdown sums back to the invocation count.
+- Sweep child rows whose session row is gone. The v1 migration ran with
+  `foreign_keys=OFF` and left 2,245 orphans behind, worth 21,292 phantom tool calls in
+  any aggregate that did not join sessions. `session_content` is left alone, since its
+  text can be the last copy of a reaped transcript.
+
+
 ## 0.4.4
 
 - Attribute token cost to individual tools. `session_tools` gains `write_tokens`,

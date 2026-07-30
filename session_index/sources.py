@@ -180,6 +180,30 @@ def _add_claude_usage(totals: dict, model: str | None, usage) -> None:
 
 
 TOOL_TOKEN_FIELDS = ("write_tokens", "inject_tokens", "result_bytes")
+DETAIL_FIELDS = TOOL_TOKEN_FIELDS + ("use_count",)
+_MCP_PREFIX_RE = re.compile(r"^mcp__(?P<server>.+?)__(?P<tool>.+)$")
+
+
+def canonical_tool_name(name: str) -> str:
+    """Collapse per-harness MCP spellings onto one <server>.<tool> name.
+
+    Claude writes mcp__<server>__<tool>; codex writes <server>.<tool> for the
+    same tool, so without this a tool's totals split across sources.
+    """
+    match = _MCP_PREFIX_RE.match(name or "")
+    if not match:
+        return name
+    return f"{match['server']}.{match['tool']}"
+
+
+def _mcp_result_size(result) -> int:
+    if isinstance(result, dict):
+        for key in ("Ok", "Err", "ok", "err"):
+            if key in result:
+                return _mcp_result_size(result[key])
+        if "content" in result:
+            return _tool_result_size(result["content"])
+    return _tool_result_size(result)
 
 
 def _tool_result_size(value) -> int:
@@ -191,6 +215,65 @@ def _tool_result_size(value) -> int:
             for part in value
         )
     return len(str(value or ""))
+
+
+_SUBCOMMAND_DRIVERS = frozenset((
+    "git", "gh", "docker", "aws", "uv", "npm", "pnpm", "yarn", "cargo", "go",
+    "kubectl", "terraform", "brew", "pip", "systemctl", "overmind", "tmux",
+    "bun", "poetry", "helm", "gcloud", "az", "make",
+))
+_VALUE_FLAGS = frozenset(("-C", "-c", "--git-dir", "--work-tree", "-p", "--profile"))
+_PREFIX_COMMANDS = frozenset((
+    "cd", "pushd", "popd", "export", "source", ".", "set", "unset",
+    "echo", "printf", "true", ":",
+))
+_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SEGMENT_RE = re.compile(r"\s*(?:&&|\|\||[|;\n])\s*")
+
+
+def _segment_command(segment: str) -> str:
+    tokens = [token for token in segment.split() if token]
+    while tokens and (
+        _ASSIGNMENT_RE.match(tokens[0])
+        or tokens[0] in ("sudo", "command", "time", "exec", "env")
+    ):
+        tokens.pop(0)
+    if not tokens:
+        return ""
+    name = tokens[0].split("/")[-1]
+    if name not in _SUBCOMMAND_DRIVERS:
+        return name
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token in _VALUE_FLAGS:
+            index += 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return f"{name} {token}"
+    return name
+
+
+def bash_command(command) -> str:
+    """Name the command a bash invocation is really running.
+
+    Leading navigation and output decoration are skipped, so `cd x && grep y`
+    reports grep rather than cd. Only the first real command is credited, so a
+    per-command breakdown sums back to the invocation count.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return ""
+    names = [
+        name for name in (
+            _segment_command(segment)
+            for segment in _SEGMENT_RE.split(command.strip())
+        ) if name
+    ]
+    if not names:
+        return ""
+    return next((name for name in names if name not in _PREFIX_COMMANDS), names[0])
 
 
 class _ToolTokens:
@@ -205,25 +288,45 @@ class _ToolTokens:
 
     def __init__(self):
         self.totals: dict[str, dict[str, int]] = {}
-        self._pending: dict[str, str] = {}
-        self._since_call: list[tuple[str, int]] = []
+        self.details: dict[tuple[str, str], dict[str, int]] = {}
+        self._pending: dict[str, tuple[str, str]] = {}
+        self._since_call: list[tuple[str, str, int]] = []
         self._context: int | None = None
 
     def bucket(self, name: str) -> dict:
         return self.totals.setdefault(name, dict.fromkeys(TOOL_TOKEN_FIELDS, 0))
 
+    def _add(self, name: str, detail: str, field: str, value: int) -> None:
+        bucket = self.bucket(name)
+        if field in bucket:
+            bucket[field] += value
+        if detail:
+            self.details.setdefault(
+                (name, detail), dict.fromkeys(DETAIL_FIELDS, 0)
+            )[field] += value
+
+    @staticmethod
+    def _identify(block: dict) -> tuple[str, str]:
+        name = canonical_tool_name(block.get("name") or "") or "unknown"
+        if name != "Bash":
+            return name, ""
+        return name, bash_command((block.get("input") or {}).get("command"))
+
     def _attribute_growth(self, context: int) -> None:
         if self._context is not None and self._since_call:
             delta = max(0, context - self._context)
-            total = sum(size for _, size in self._since_call) or 1
-            for name, size in self._since_call:
-                self.bucket(name)["inject_tokens"] += delta * size // total
+            total = sum(size for _, _, size in self._since_call) or 1
+            for name, detail, size in self._since_call:
+                self._add(name, detail, "inject_tokens", delta * size // total)
         self._context = context
         self._since_call = []
 
     def assistant(self, message: dict) -> None:
         content = message.get("content")
-        blocks = content if isinstance(content, list) else []
+        blocks = [
+            block for block in (content if isinstance(content, list) else [])
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+        ]
         usage = message.get("usage")
         if isinstance(usage, dict):
             self._attribute_growth(
@@ -231,35 +334,27 @@ class _ToolTokens:
                 + (usage.get("cache_creation_input_tokens") or 0)
                 + (usage.get("cache_read_input_tokens") or 0)
             )
-            emitted = [
-                block.get("name") or "unknown" for block in blocks
-                if isinstance(block, dict) and block.get("type") == "tool_use"
-            ]
-            if emitted:
-                share = (usage.get("output_tokens") or 0) // len(emitted)
-                for name in emitted:
-                    self.bucket(name)["write_tokens"] += share
+            if blocks:
+                share = (usage.get("output_tokens") or 0) // len(blocks)
+                for block in blocks:
+                    name, detail = self._identify(block)
+                    self._add(name, detail, "write_tokens", share)
         for block in blocks:
-            if isinstance(block, dict) and block.get("type") == "tool_use":
-                self._pending[block.get("id")] = block.get("name") or "unknown"
+            name, detail = self._identify(block)
+            self._pending[block.get("id")] = (name, detail)
+            self._add(name, detail, "use_count", 1)
 
     def result(self, message: dict) -> None:
         content = message.get("content")
         for block in content if isinstance(content, list) else []:
             if not isinstance(block, dict) or block.get("type") != "tool_result":
                 continue
-            name = self._pending.pop(block.get("tool_use_id"), "unknown")
+            name, detail = self._pending.pop(
+                block.get("tool_use_id"), ("unknown", "")
+            )
             size = _tool_result_size(block.get("content"))
-            self.bucket(name)["result_bytes"] += size
-            self._since_call.append((name, size))
-
-    def record_call(self, call_id: str | None, name: str) -> None:
-        if call_id:
-            self._pending[call_id] = name
-
-    def record_output(self, call_id: str | None, output) -> None:
-        name = self._pending.pop(call_id, "unknown")
-        self.bucket(name)["result_bytes"] += _tool_result_size(output)
+            self._add(name, detail, "result_bytes", size)
+            self._since_call.append((name, detail, size))
 
 
 def _codex_usage(model: str | None, totals: dict, turns: int) -> dict:
@@ -365,7 +460,7 @@ def _claude_text(content, assistant: bool = False) -> tuple[str, list[str]]:
         elif isinstance(block, dict) and block.get("type") == "text":
             parts.append(sanitize_text(block.get("text", "")))
         elif assistant and isinstance(block, dict) and block.get("type") == "tool_use":
-            name = sanitize_text(block.get("name", ""), 200)
+            name = canonical_tool_name(sanitize_text(block.get("name", ""), 200))
             if name:
                 tool_names.append(name)
                 parts.append(f"[{name}]")
@@ -583,6 +678,7 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
             "metadata_json": json.dumps({"format": "claude-code"}, sort_keys=True),
             "tools": tools,
             "tool_tokens": tool_tokens.totals,
+            "tool_details": tool_tokens.details,
             "agents": agents,
             "usage": usage,
             "fts_content": _build_fts(fts_messages),
@@ -639,14 +735,14 @@ class CodexSourceAdapter(SessionSourceAdapter):
         saw_compaction = False
         saw_session_meta = False
         metadata: dict = {"format": "codex-rollout"}
-        # one MCP call emits both a function_call and an mcp_tool_call_end; key by call_id
-        codex_calls: dict[str, str] = {}
         event_messages: list[tuple[str, str]] = []
         # total_token_usage is cumulative per rollout, so keep the largest record
         best_usage: dict = {}
         turns = 0
         previous_turn = None
         tool_tokens = _ToolTokens()
+        # one MCP call emits a function_call and an mcp_tool_call_end sharing a call_id
+        codex_calls: dict[str, dict] = {}
 
         for entry in _read_jsonl(path):
             timestamp = entry.get("timestamp")
@@ -705,15 +801,21 @@ class CodexSourceAdapter(SessionSourceAdapter):
                     )
                     if name:
                         call_id = payload.get("call_id") or f"anon-{len(codex_calls)}"
-                        codex_calls.setdefault(call_id, name)
-                        tool_tokens.record_call(payload.get("call_id"), name)
+                        record = codex_calls.setdefault(
+                            call_id,
+                            {"name": name, "result_bytes": 0, "canonical": False},
+                        )
+                        if not record["canonical"]:
+                            record["name"] = name
                     agent = _tool_agent_name(payload)
                     if agent:
                         agents[agent] = agents.get(agent, 0) + 1
                 elif isinstance(item_type, str) and item_type.endswith("_output"):
-                    tool_tokens.record_output(
-                        payload.get("call_id"), payload.get("output")
-                    )
+                    record = codex_calls.get(payload.get("call_id"))
+                    if record is not None:
+                        record["result_bytes"] += _tool_result_size(
+                            payload.get("output")
+                        )
                 # reasoning, tool outputs, and developer/system messages are
                 # intentionally excluded.
             elif (
@@ -754,7 +856,15 @@ class CodexSourceAdapter(SessionSourceAdapter):
                 name = ".".join(part for part in (server, tool) if part)
                 if name:
                     call_id = payload.get("call_id") or f"mcp-{len(codex_calls)}"
-                    codex_calls[call_id] = name
+                    record = codex_calls.setdefault(
+                        call_id,
+                        {"name": name, "result_bytes": 0, "canonical": True},
+                    )
+                    record["name"] = name
+                    record["canonical"] = True
+                    record["result_bytes"] += _mcp_result_size(
+                        payload.get("result")
+                    )
 
         # review/exec subagent rollouts carry their turns only as events
         if not fts_messages:
@@ -770,8 +880,11 @@ class CodexSourceAdapter(SessionSourceAdapter):
                     user_prompts.append(text)
                 fts_messages.append(text)
 
-        for name in codex_calls.values():
-            tools[name] = tools.get(name, 0) + 1
+        for record in codex_calls.values():
+            tools[record["name"]] = tools.get(record["name"], 0) + 1
+            tool_tokens.bucket(record["name"])["result_bytes"] += (
+                record["result_bytes"]
+            )
 
         project = cwd or path.parent.name
         project_name = Path(cwd).name if cwd else path.parent.name
@@ -804,6 +917,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
             "metadata_json": json.dumps(metadata, sort_keys=True),
             "tools": tools,
             "tool_tokens": tool_tokens.totals,
+            "tool_details": tool_tokens.details,
             "agents": agents,
             "usage": _codex_usage(model, best_usage, turns),
             "fts_content": _build_fts(fts_messages),

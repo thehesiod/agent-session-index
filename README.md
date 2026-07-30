@@ -86,6 +86,8 @@ sessions usage --by agent --week
 sessions usage --by day --days 30 --subagents exclude
 sessions usage --by tool
 sessions usage --tool Read
+sessions usage --by command
+sessions usage --by command --tool Bash --week
 
 # Index all enabled sources, or one source
 sessions index
@@ -251,6 +253,21 @@ compaction or emitted by a parent session, lands under `unknown` rather than bei
 smeared across the known tools.
 
 Codex records no per-call token split, so its tools report `result` bytes only.
+
+MCP tool names are canonicalized to `<server>.<tool>`. Claude writes
+`mcp__codegraph__codegraph_search` and codex writes `codegraph.codegraph_search` for the
+same tool, so without this a tool's totals split across sources and each half looks
+small. Codex also emits both a `function_call` and an `mcp_tool_call_end` for one call,
+so calls are keyed by `call_id` and counted once.
+
+### Bash by command
+
+`sessions usage --by command` breaks Bash down by what it actually ran. Leading
+navigation and output decoration are skipped, so `cd repo && grep -rn foo` is credited to
+grep, not cd. Only the first real command of a pipeline or `&&` chain is credited, so the
+breakdown sums back to the invocation count for every transcript still on disk. Tools
+whose transcript was reaped keep their `session_tools` count but can have no breakdown.
+`--tool <name>` selects a different tool to break down.
 
 Caveats. Codex reports one cumulative total per rollout rather than per call, so a
 codex session gets a single row under its last known model, and `calls` counts model

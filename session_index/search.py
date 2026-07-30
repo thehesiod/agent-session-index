@@ -246,6 +246,42 @@ class SessionSearch:
                subagents: str = "include") -> list[dict]:
         return self.find(limit=n, source=source, subagents=subagents)
 
+    def tool_detail(self, tool: str = "Bash", source: str | None = None,
+                    project: str | None = None, days: int | None = None,
+                    week: bool = False, subagents: str = "include",
+                    limit: int = 25) -> list[dict]:
+        """Token cost per command within one tool, e.g. bash by command."""
+        conditions = ["d.tool_name = ?"]
+        params: list = [tool]
+        source_clause, source_params = self._source_condition(source)
+        conditions.append(source_clause)
+        conditions.append(self._subagent_condition(subagents))
+        params.extend(source_params)
+        if project:
+            conditions.append("(s.project_name LIKE ? OR s.project LIKE ?)")
+            params.extend([f"%{project}%", f"%{project}%"])
+        if week or days:
+            conditions.append("s.start_time >= ?")
+            params.append(
+                (datetime.now() - timedelta(days=days or 7)).isoformat()
+            )
+        params.append(limit)
+        statement = (
+            "SELECT d.detail AS grouping, NULL AS title, "
+            "COUNT(DISTINCT s.source || ':' || s.session_id) AS sessions, "
+            "SUM(d.use_count) AS calls, "
+            "SUM(d.write_tokens) AS write_tokens, "
+            "SUM(d.inject_tokens) AS inject_tokens, "
+            "SUM(d.result_bytes) AS result_bytes "
+            "FROM session_tool_detail d "
+            "JOIN sessions s ON s.source = d.session_source "
+            "AND s.session_id = d.session_id "
+            "WHERE " + " AND ".join(conditions) + " "
+            "GROUP BY grouping HAVING grouping IS NOT NULL AND grouping != '' "
+            "ORDER BY inject_tokens DESC, calls DESC LIMIT ?"
+        )
+        return [dict(row) for row in self.conn.execute(statement, params)]
+
     def tool_tokens(self, tool: str | None = None, source: str | None = None,
                     project: str | None = None, days: int | None = None,
                     week: bool = False, subagents: str = "include",

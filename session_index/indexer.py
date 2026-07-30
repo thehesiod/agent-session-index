@@ -135,7 +135,24 @@ class SessionIndexer:
             "CREATE INDEX IF NOT EXISTS idx_sessions_parent "
             "ON sessions(source, parent_session_id)"
         )
+        self._sweep_orphans()
         self.conn.commit()
+
+    def _sweep_orphans(self):
+        """Drop derived rows whose session row is gone.
+
+        The v1 migration ran with foreign_keys=OFF, which left child rows behind
+        and inflated any aggregate that does not join sessions. Only rebuildable
+        counts are swept; session_content is left alone because its text may be
+        the last copy of a reaped transcript.
+        """
+        for table in ("session_tools", "session_tool_detail", "session_agents",
+                      "session_topics", "session_usage"):
+            self.conn.execute(
+                "DELETE FROM " + table + " AS c WHERE NOT EXISTS ("
+                "SELECT 1 FROM sessions s WHERE s.source = c.session_source "
+                "AND s.session_id = c.session_id)"
+            )
 
     def _create_v2_tables(self):
         statements = (
@@ -197,6 +214,19 @@ class SessionIndexer:
                 FOREIGN KEY (session_source, session_id)
                     REFERENCES sessions(source, session_id) ON DELETE CASCADE
             )""",
+            """CREATE TABLE IF NOT EXISTS session_tool_detail (
+                session_source TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                use_count INTEGER DEFAULT 0,
+                write_tokens INTEGER DEFAULT 0,
+                inject_tokens INTEGER DEFAULT 0,
+                result_bytes INTEGER DEFAULT 0,
+                PRIMARY KEY (session_source, session_id, tool_name, detail),
+                FOREIGN KEY (session_source, session_id)
+                    REFERENCES sessions(source, session_id) ON DELETE CASCADE
+            )""",
             """CREATE TABLE IF NOT EXISTS session_usage (
                 session_source TEXT NOT NULL,
                 session_id TEXT NOT NULL,
@@ -222,6 +252,8 @@ class SessionIndexer:
             "CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_time)",
             "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
             "CREATE INDEX IF NOT EXISTS idx_usage_model ON session_usage(model)",
+            "CREATE INDEX IF NOT EXISTS idx_detail_tool "
+            "ON session_tool_detail(tool_name, detail)",
             "CREATE INDEX IF NOT EXISTS idx_topics_session "
             "ON session_topics(session_source, session_id)",
             "CREATE INDEX IF NOT EXISTS idx_topics_source ON session_topics(source)",
@@ -470,6 +502,22 @@ class SessionIndexer:
                     counts.get("write_tokens", 0),
                     counts.get("inject_tokens", 0),
                     counts.get("result_bytes", 0),
+                ))
+
+            self.conn.execute(
+                "DELETE FROM session_tool_detail "
+                "WHERE session_source=? AND session_id=?", identity
+            )
+            for (tool, detail), counts in (data.get("tool_details") or {}).items():
+                self.conn.execute("""
+                    INSERT INTO session_tool_detail (
+                        session_source, session_id, tool_name, detail,
+                        use_count, write_tokens, inject_tokens, result_bytes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    *identity, tool, detail, counts["use_count"],
+                    counts["write_tokens"], counts["inject_tokens"],
+                    counts["result_bytes"],
                 ))
 
             self.conn.execute(
