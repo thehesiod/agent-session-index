@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.1
+
+- Raise the per-session FTS cap from 100K to 8M characters. Tool output is already
+  excluded, so a session's indexed text is only ~1.5-2% of its transcript, but long
+  sessions still blew past 100K and lost their late prose. A PR review that happened
+  75% of the way through an 11MB session was unfindable, and 107 of 1641 indexed
+  sessions sat at the cap.
+- Accept repeated `--session` and `--file` on `sessions index`, to force a reindex of
+  specific transcripts. `--backfill` skips anything whose content hash and path still
+  match, so it cannot refresh rows after an extraction rule changes.
+
 ## 0.4.0
 
 - Rename the package and user-facing product to Agent Session Index.

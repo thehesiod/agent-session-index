@@ -79,7 +79,14 @@ sessions index
 sessions index --backfill
 sessions index --backfill --source codex
 sessions index --session <id> --source claude
+
+# Force a reindex of specific transcripts, whose content hash has not changed
+sessions index --file <path> --file <path>
 ```
+
+`--session` and `--file` both bypass the unchanged-content check, so they are the
+way to refresh rows after an extraction rule changes. `--backfill` will not: it
+skips any transcript whose hash and path still match the indexed row.
 
 The legacy `session-index`, `session-search`, `session-analyze`, and
 `session-topic-capture` entry points remain available.

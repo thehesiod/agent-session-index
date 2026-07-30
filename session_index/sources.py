@@ -21,7 +21,8 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 MAX_MESSAGE_CHARS = 20_000
-MAX_FTS_CHARS = 100_000
+# Prose is ~1.5-2% of transcript bytes once tool I/O is excluded; largest seen is 4.9MB.
+MAX_FTS_CHARS = 8_000_000
 MAX_SUMMARY_CHARS = 2_000
 
 _DATA_URL_RE = re.compile(

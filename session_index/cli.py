@@ -143,7 +143,8 @@ def main():
 
     command = subparsers.add_parser("index", help="Index local sessions")
     command.add_argument("--backfill", action="store_true")
-    command.add_argument("--session", metavar="ID")
+    command.add_argument("--session", metavar="ID", action="append")
+    command.add_argument("--file", metavar="PATH", action="append")
     command.add_argument("--claude-root", metavar="PATH")
     command.add_argument("--codex-root", metavar="PATH")
     _add_source(command)
@@ -190,10 +191,15 @@ def main():
         try:
             if args.backfill:
                 indexer.backfill_all(source=args.source)
-            elif args.session:
-                if not indexer.index_session(
-                    session_id=args.session, source=args.source
-                ):
+            elif args.session or args.file:
+                targets = [{"session_id": s} for s in args.session or []]
+                targets += [{"file_path": f} for f in args.file or []]
+                failed = sum(
+                    not indexer.index_session(source=args.source, **target)
+                    for target in targets
+                )
+                print(f"Reindexed {len(targets) - failed}/{len(targets)} sessions")
+                if failed:
                     raise SystemExit(1)
             else:
                 stats = indexer.index_incremental(source=args.source)

@@ -556,5 +556,92 @@ class ConfigTests(unittest.TestCase):
             self.assertTrue(sources["codex"]["enabled"])
 
 
+class LongSessionTests(unittest.TestCase):
+    def _write_long_transcript(self, root: Path) -> Path:
+        (root / "-long-project").mkdir(parents=True)
+        transcript = root / "-long-project" / "long-session.jsonl"
+        filler = "reviewed the paginator and the tombstone sweep in detail. "
+        with transcript.open("w") as handle:
+            for index in range(4000):
+                handle.write(json.dumps({
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": [
+                        {"type": "text", "text": f"turn {index}: {filler * 2}"},
+                    ]},
+                    "timestamp": "2026-01-01T00:00:00Z",
+                }) + "\n")
+            handle.write(json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "wrap up PR #4033"},
+                "timestamp": "2026-01-01T01:00:00Z",
+            }) + "\n")
+        return transcript
+
+    def _indexer(self, tempdir: str, root: Path) -> SessionIndexer:
+        indexer = SessionIndexer(
+            db_path=Path(tempdir) / "sessions.db",
+            source_configs={
+                "claude": {"enabled": True, "root": str(root)},
+                "codex": {"enabled": False, "root": str(CODEX_ROOT)},
+            },
+        )
+        indexer.connect()
+        return indexer
+
+    def test_prose_past_the_old_cap_stays_searchable(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            self._write_long_transcript(root)
+            indexer = self._indexer(tempdir, root)
+            try:
+                indexer.backfill_all(progress_interval=0)
+                (content,) = indexer.conn.execute(
+                    "SELECT content FROM session_content "
+                    "WHERE session_id='long-session'"
+                ).fetchone()
+            finally:
+                indexer.close()
+
+            self.assertGreater(len(content), 100_000)
+            self.assertIn("4033", content)
+
+    def test_index_file_refreshes_a_row_whose_hash_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            transcript = self._write_long_transcript(root)
+            db_path = Path(tempdir) / "sessions.db"
+            indexer = self._indexer(tempdir, root)
+            try:
+                indexer.backfill_all(progress_interval=0)
+                indexer.conn.execute(
+                    "UPDATE session_content SET content=substr(content,1,100000) "
+                    "WHERE session_id='long-session'"
+                )
+                indexer.conn.commit()
+                truncated = indexer.backfill_all(progress_interval=0)
+            finally:
+                indexer.close()
+
+            self.assertEqual(truncated["indexed"], 0)
+
+            argv = [
+                "sessions", "--db-path", str(db_path),
+                "index", "--claude-root", str(root), "--file", str(transcript),
+            ]
+            with patch("sys.argv", argv), redirect_stdout(io.StringIO()):
+                cli.main()
+
+            connection = sqlite3.connect(db_path)
+            try:
+                (content,) = connection.execute(
+                    "SELECT content FROM session_content "
+                    "WHERE session_id='long-session'"
+                ).fetchone()
+            finally:
+                connection.close()
+
+            self.assertIn("4033", content)
+
+
 if __name__ == "__main__":
     unittest.main()
