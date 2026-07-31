@@ -668,16 +668,15 @@ class SessionIndexer:
 
             current_hash = self._file_hash(path)
             parsed = None
-            # Codex IDs come from session_meta, so parse once to get identity.
-            if name == "codex":
+            # A filename-derived id may be wrong; the skip below still checks path + hash.
+            session_id = self.adapters[name].session_id_from_path(path)
+            if session_id is None:
                 parsed = self._parse_session(path, name)
                 if not parsed:
                     stats["errors"] += 1
                     source_stats["errors"] += 1
                     continue
                 session_id = parsed["session_id"]
-            else:
-                session_id = path.stem
 
             existing = self.conn.execute("""
                 SELECT file_hash, file_path FROM sessions

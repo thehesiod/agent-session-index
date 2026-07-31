@@ -210,6 +210,70 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(owns_live)
         self.assertFalse(owns_foreign)
 
+    def test_codex_adapter_reads_session_id_off_the_rollout_name(self):
+        adapter = CodexSourceAdapter(CODEX_ROOT)
+        session_id = "deadbeef-1234-7abc-8def-000000000001"
+
+        self.assertEqual(
+            adapter.session_id_from_path(
+                Path(f"rollout-2026-06-11T00-42-52-{session_id}.jsonl")
+            ),
+            session_id,
+        )
+
+    def test_codex_adapter_defers_to_session_meta_when_the_name_has_no_id(self):
+        adapter = CodexSourceAdapter(CODEX_ROOT)
+
+        self.assertIsNone(
+            adapter.session_id_from_path(Path("rollout-shared-session.jsonl"))
+        )
+
+    def test_claude_adapter_reads_session_id_off_the_transcript_name(self):
+        adapter = ClaudeSourceAdapter(CLAUDE_ROOT)
+
+        self.assertEqual(
+            adapter.session_id_from_path(Path("shared-session.jsonl")),
+            "shared-session",
+        )
+
+
+class IncrementalReparseTests(unittest.TestCase):
+    def test_unchanged_codex_rollout_is_not_reparsed(self):
+        source = next(CodexSourceAdapter(CODEX_ROOT).discover())
+        session_id = "deadbeef-1234-7abc-8def-000000000001"
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "sessions"
+            (root / "2026" / "01" / "02").mkdir(parents=True)
+            rollout = (
+                root / "2026" / "01" / "02"
+                / f"rollout-2026-01-02T00-00-00-{session_id}.jsonl"
+            )
+            lines = source.read_text().splitlines()
+            meta = json.loads(lines[0])
+            meta["payload"]["id"] = session_id
+            lines[0] = json.dumps(meta)
+            rollout.write_text("\n".join(lines) + "\n")
+
+            indexer = SessionIndexer(
+                db_path=Path(tempdir) / "sessions.db",
+                source_configs={
+                    "claude": {"enabled": False},
+                    "codex": {"enabled": True, "root": str(root)},
+                },
+            )
+            indexer.connect()
+            try:
+                self.assertEqual(indexer.backfill_all(progress_interval=0)["indexed"], 1)
+                with patch.object(
+                    CodexSourceAdapter, "parse", side_effect=AssertionError("reparsed")
+                ):
+                    stats = indexer.index_incremental()
+            finally:
+                indexer.close()
+
+        self.assertEqual(stats["unchanged"], 1)
+        self.assertEqual(stats["indexed"], 0)
+
 
 class IndexIntegrationTests(unittest.TestCase):
     def setUp(self):

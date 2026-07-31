@@ -629,6 +629,10 @@ class SessionSourceAdapter:
     def discover(self) -> Iterable[Path]:
         raise NotImplementedError
 
+    def session_id_from_path(self, path: Path) -> Optional[str]:
+        """Session id derivable from the filename, or None if it needs a parse."""
+        return None
+
     def parse(self, path: Path) -> Optional[dict]:
         raise NotImplementedError
 
@@ -651,6 +655,9 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
             for pattern in ("*.jsonl", "**/subagents/**/*.jsonl")
             for path in project_dir.glob(pattern)
         )
+
+    def session_id_from_path(self, path: Path) -> Optional[str]:
+        return path.stem
 
     def _project(self, path: Path) -> str:
         # Subagent transcripts sit two levels deeper, under <session>/subagents/
@@ -835,6 +842,11 @@ class CodexSourceAdapter(SessionSourceAdapter):
     # codex archives a session by MOVING its rollout into a sibling archived_sessions/
     ARCHIVED_DIR = "archived_sessions"
 
+    # rollout-<timestamp>-<session id>.jsonl; the id also appears in session_meta
+    ROLLOUT_ID_RE = re.compile(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    )
+
     def roots(self) -> Iterable[Path]:
         yield self.root
         archived = self.root.parent / self.ARCHIVED_DIR
@@ -845,6 +857,10 @@ class CodexSourceAdapter(SessionSourceAdapter):
         for root in self.roots():
             if root.exists():
                 yield from root.rglob("*.jsonl")
+
+    def session_id_from_path(self, path: Path) -> Optional[str]:
+        match = self.ROLLOUT_ID_RE.search(path.stem)
+        return match.group(0) if match else None
 
     def parse(self, path: Path) -> Optional[dict]:
         session_id = path.stem
