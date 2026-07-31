@@ -31,6 +31,12 @@
 - Mark, never drop, a result that a newer session in the same project supersedes on an
   identical topic. Search had no notion of time at all, so a stale answer and its
   correction ranked purely on term frequency.
+- Load the embedding model without contacting huggingface.co. from_pretrained
+  revalidates a cached model over the network on every call, which cost 1.8s per search
+  and told a third party that this machine was running one - indefensible in a tool whose
+  premise is that transcripts never leave the box. The hot path now loads offline and
+  falls back to a single download when the model is not yet cached. A warm search is
+  0.6s at 5 results and 1.2s at 20, from 4.3s and 31s.
 - `sessions` gains a `prose_chars` column recording where prose ends and the tool digest
   begins, so the vector layer can embed one half without re-parsing.
 

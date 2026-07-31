@@ -8,6 +8,7 @@ alone, so the base package stays stdlib-only.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import struct
 from pathlib import Path
@@ -27,6 +28,7 @@ try:
 except ImportError:
     import config
 
+HF_OFFLINE_VAR = "HF_HUB_OFFLINE"
 EMBED_DIMS = 512
 CHUNK_CHARS = 1_200
 CHUNK_OVERLAP = 200
@@ -62,8 +64,20 @@ class SemanticUnavailable(RuntimeError):
     pass
 
 
+def _restore_env(key: str, value: str | None):
+    if value is None:
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = value
+
+
 def _load_model():
-    """Load the static embedding model once per process."""
+    """Load the static embedding model once per process, without phoning home.
+
+    from_pretrained revalidates a cached model over the network, costing ~1.8s
+    per invocation and telling huggingface.co that this machine is running a
+    search - unacceptable for a tool that indexes private transcripts.
+    """
     global _model, _model_error
     if _model is not None:
         return _model
@@ -76,11 +90,20 @@ def _load_model():
         )
         raise SemanticUnavailable(_model_error)
     name = config.get_embed_model()
+    previous = os.environ.get(HF_OFFLINE_VAR)
+    os.environ[HF_OFFLINE_VAR] = "1"
     try:
         _model = StaticModel.from_pretrained(name)
-    except Exception as exc:
-        _model_error = f"could not load {name}: {exc}"
-        raise SemanticUnavailable(_model_error) from exc
+    except Exception:
+        # Not cached yet, so allow exactly one download
+        _restore_env(HF_OFFLINE_VAR, previous)
+        try:
+            _model = StaticModel.from_pretrained(name)
+        except Exception as exc:
+            _model_error = f"could not load {name}: {exc}"
+            raise SemanticUnavailable(_model_error) from exc
+    finally:
+        _restore_env(HF_OFFLINE_VAR, previous)
     return _model
 
 
