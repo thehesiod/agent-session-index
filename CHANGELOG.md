@@ -24,6 +24,10 @@
   a near-tie without burying a strongly-relevant old one. `--no-recency`, `--half-life`,
   and `--days` tune or disable it; `recency_half_life_days` and `recency_weight` set the
   defaults in config.
+- Set `recency_weight` to 0.1 by measurement rather than taste. Swept against 225
+  historical-lookup queries, where recency is a liability by construction: 0.1 scores
+  recall@1 42.2% against 41.3% for no recency at all and 35.6% at 0.5. A light touch
+  breaks ties; a heavy one buries the right answer.
 - Mark, never drop, a result that a newer session in the same project supersedes on an
   identical topic. Search had no notion of time at all, so a stale answer and its
   correction ranked purely on term frequency.

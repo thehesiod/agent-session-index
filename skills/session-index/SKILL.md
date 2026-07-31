@@ -34,7 +34,8 @@ Do not upload transcript content or call an external synthesis API.
 - **Vector (optional)** covers prose only, so paraphrases match where no keyword does.
   Needs the `semantic` extra; without it search silently falls back to keyword alone.
 - **Recency** multiplies the fused score by a 90-day half-life decay, so a fresh session
-  wins a near-tie without burying a strongly-relevant old one.
+  wins a near-tie without burying a strongly-relevant old one. The weight is deliberately
+  light (0.1); it breaks ties rather than reordering on age.
 - **Supersession** marks (never drops) an older result when a newer one in the same
   project repeats its topic. Look for `superseded by <id>` in the result metadata.
 

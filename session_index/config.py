@@ -20,7 +20,8 @@ DEFAULTS = {
     "project_names": {},
     "embed_model": "minishlab/potion-base-32M",
     "recency_half_life_days": 90,
-    "recency_weight": 0.5,
+    # Swept on 225 historical-lookup queries: 0.1 beats both 0 and 0.5, and 0.5 costs 5.7pt of recall@1
+    "recency_weight": 0.1,
     "sources": {
         "claude": {
             "enabled": True,
