@@ -13,9 +13,11 @@ from typing import Optional
 
 try:
     from . import config
+    from . import semantic
     from .sources import build_adapters
 except ImportError:
     import config
+    import semantic
     from sources import build_adapters
 
 SCHEMA_VERSION = 3
@@ -29,8 +31,12 @@ class SessionIndexer:
         projects_dir: Path = None,
         codex_sessions_dir: Path = None,
         source_configs: dict | None = None,
+        embed: bool = True,
     ):
         self.db_path = Path(db_path) if db_path else config.get_db_path()
+        self.embed_enabled = embed
+        # False means "not yet resolved"; None means "resolved to unavailable"
+        self._semantic: object = False
         overrides = dict(source_configs or {})
         if projects_dir:
             overrides["claude"] = {
@@ -106,6 +112,14 @@ class SessionIndexer:
             if "agent_name" not in columns:
                 self.conn.execute(
                     "ALTER TABLE sessions ADD COLUMN agent_name TEXT"
+                )
+            if "prose_chars" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN prose_chars INTEGER DEFAULT 0"
+                )
+            if "content_chars" not in columns:
+                self.conn.execute(
+                    "ALTER TABLE sessions ADD COLUMN content_chars INTEGER DEFAULT 0"
                 )
             if "cache_write_5m_tokens" not in self._columns("session_usage"):
                 self.conn.execute(
@@ -436,6 +450,38 @@ class SessionIndexer:
         data = self._parse_session(path, name)
         return bool(data and self._upsert_session(data))
 
+    def _semantic_index(self):
+        """Lazily attach the vector index; None whenever the extra is absent."""
+        if self._semantic is not False:
+            return self._semantic
+        self._semantic = None
+        if not self.embed_enabled or not semantic.available():
+            return None
+        index = semantic.SemanticIndex(self.conn)
+        if not index.enabled:
+            return None
+        try:
+            index.ensure_schema(semantic.model_dims())
+        except semantic.SemanticUnavailable as exc:
+            print(f"Semantic index disabled: {exc}", file=sys.stderr)
+            return None
+        self._semantic = index
+        return index
+
+    def _embed_session(self, identity: tuple[str, str], data: dict):
+        index = self._semantic_index()
+        if index is None:
+            return
+        # Only the prose half is embedded; the tool digest is lexical territory
+        prose = (data.get("fts_content") or "")[:data.get("prose_chars") or 0]
+        try:
+            index.index_session(*identity, prose)
+        except (sqlite3.Error, semantic.SemanticUnavailable) as exc:
+            print(
+                f"Embedding failed for {identity[0]}:{identity[1]}: {exc}",
+                file=sys.stderr,
+            )
+
     def _upsert_session(self, data: dict) -> bool:
         try:
             now = datetime.now().isoformat()
@@ -448,6 +494,8 @@ class SessionIndexer:
                 data["model"], data["has_compaction"],
                 data.get("metadata_json"), now, now, data["file_hash"],
                 data.get("parent_session_id"), data.get("agent_name"),
+                data.get("prose_chars") or 0,
+                len(data.get("fts_content") or ""),
             )
             self.conn.execute("""
                 INSERT INTO sessions (
@@ -455,10 +503,11 @@ class SessionIndexer:
                     title_display, tags, client, file_path, file_size,
                     exchange_count, start_time, end_time, duration_minutes,
                     model, has_compaction, metadata_json, indexed_at,
-                    last_modified, file_hash, parent_session_id, agent_name
+                    last_modified, file_hash, parent_session_id, agent_name,
+                    prose_chars, content_chars
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?
+                    ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(source, session_id) DO UPDATE SET
                     parent_session_id=excluded.parent_session_id,
@@ -481,7 +530,9 @@ class SessionIndexer:
                     metadata_json=excluded.metadata_json,
                     indexed_at=excluded.indexed_at,
                     last_modified=excluded.last_modified,
-                    file_hash=excluded.file_hash
+                    file_hash=excluded.file_hash,
+                    prose_chars=excluded.prose_chars,
+                    content_chars=excluded.content_chars
             """, values)
 
             identity = (data["source"], data["session_id"])
@@ -561,6 +612,7 @@ class SessionIndexer:
                     INSERT INTO session_content (source, session_id, content)
                     VALUES (?, ?, ?)
                 """, (*identity, data["fts_content"]))
+            self._embed_session(identity, data)
 
             for topic in data["topics"]:
                 existing = self.conn.execute("""

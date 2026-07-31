@@ -9,6 +9,7 @@ from pathlib import Path
 
 try:
     from . import config
+    from . import semantic
     from .analyzer import (
         analytics,
         format_analytics,
@@ -20,6 +21,7 @@ try:
     from .search import SessionSearch, format_result
 except ImportError:
     import config
+    import semantic
     from analyzer import (
         analytics,
         format_analytics,
@@ -33,7 +35,7 @@ except ImportError:
 SOURCES = ("claude", "codex")
 SUBCOMMANDS = {
     "context", "analytics", "synthesize", "recent", "find",
-    "tools", "topics", "stats", "index", "search", "usage",
+    "tools", "topics", "stats", "index", "search", "usage", "embed",
 }
 
 
@@ -50,6 +52,80 @@ def _add_subagents(parser):
         default="include",
         help="Whether subagent transcripts take part (default: include)",
     )
+
+
+def _add_ranking(parser):
+    parser.add_argument(
+        "--no-semantic", action="store_true",
+        help="Skip the vector layer and rank on FTS alone",
+    )
+    parser.add_argument(
+        "--no-recency", action="store_true",
+        help="Rank purely on relevance, ignoring session age",
+    )
+    parser.add_argument(
+        "--half-life", type=float, metavar="DAYS",
+        help="Recency half-life in days (default: 90)",
+    )
+    parser.add_argument(
+        "--days", type=int, metavar="N",
+        help="Only search sessions from the last N days",
+    )
+
+
+def run_embed(db_path: Path, rebuild: bool = False, limit: int | None = None,
+              source: str | None = None):
+    """Backfill the vector layer over already-indexed sessions."""
+    reason = semantic.unavailable_reason()
+    if reason:
+        print(f"Semantic layer unavailable: {reason}", file=sys.stderr)
+        raise SystemExit(1)
+    conn, index = semantic.open_index(db_path)
+    if not index.enabled:
+        print(
+            "sqlite-vec is not loadable - "
+            "pip install 'agent-session-index[semantic]'",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    index.ensure_schema(semantic.model_dims())
+    conditions = ["c.content IS NOT NULL", "s.prose_chars > 0"]
+    params: list = []
+    if source:
+        conditions.append("s.source = ?")
+        params.append(source)
+    if not rebuild:
+        conditions.append(
+            "NOT EXISTS (SELECT 1 FROM session_chunks k "
+            "WHERE k.source = s.source AND k.session_id = s.session_id)"
+        )
+    statement = (
+        "SELECT s.source, s.session_id, s.prose_chars, c.content "
+        "FROM sessions s JOIN session_content c "
+        "ON c.source = s.source AND c.session_id = s.session_id "
+        "WHERE " + " AND ".join(conditions) + " ORDER BY s.start_time DESC"
+    )
+    if limit:
+        statement += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(statement, params).fetchall()
+    total_chunks = 0
+    for done, row in enumerate(rows, start=1):
+        total_chunks += index.index_session(
+            row["source"], row["session_id"],
+            (row["content"] or "")[:row["prose_chars"]],
+        )
+        if done % 50 == 0:
+            conn.commit()
+            print(f"  {done}/{len(rows)} sessions, {total_chunks} chunks")
+    conn.commit()
+    stats = index.stats()
+    print(
+        f"Embedded {len(rows)} sessions ({total_chunks} chunks). "
+        f"Index now holds {stats['chunks']} chunks "
+        f"across {stats['sessions']} sessions."
+    )
+    conn.close()
 
 
 def _print_inline_context(result: dict, query: str, db_path: Path):
@@ -188,12 +264,13 @@ def main():
     )
     subparsers = parser.add_subparsers(dest="command")
 
-    command = subparsers.add_parser("search", help="Full-text search")
+    command = subparsers.add_parser("search", help="Hybrid keyword + vector search")
     command.add_argument("query")
     command.add_argument("-n", "--limit", type=int, default=20)
     command.add_argument("--context", action="store_true")
     _add_source(command)
     _add_subagents(command)
+    _add_ranking(command)
 
     command = subparsers.add_parser("context", help="Conversation context")
     command.add_argument("session_id", help="Session ID, prefix, or source:id")
@@ -272,6 +349,20 @@ def main():
     command.add_argument("--file", metavar="PATH", action="append")
     command.add_argument("--claude-root", metavar="PATH")
     command.add_argument("--codex-root", metavar="PATH")
+    command.add_argument(
+        "--no-embed", action="store_true",
+        help="Skip the vector layer while indexing",
+    )
+    _add_source(command)
+
+    command = subparsers.add_parser(
+        "embed", help="Build or refresh the semantic vector layer"
+    )
+    command.add_argument(
+        "--rebuild", action="store_true",
+        help="Re-embed every session, not just those with no vectors",
+    )
+    command.add_argument("-n", "--limit", type=int, help="Stop after N sessions")
     _add_source(command)
 
     raw_args = sys.argv[1:]
@@ -300,6 +391,11 @@ def main():
         Path(args.db_path).expanduser()
         if args.db_path else config.get_db_path()
     )
+    if args.command == "embed":
+        run_embed(db_path, rebuild=args.rebuild, limit=args.limit,
+                  source=args.source)
+        return
+
     if args.command == "index":
         try:
             from .indexer import SessionIndexer
@@ -311,6 +407,7 @@ def main():
             if args.claude_root else None,
             codex_sessions_dir=Path(args.codex_root).expanduser()
             if args.codex_root else None,
+            embed=not args.no_embed,
         )
         indexer.connect()
         try:
@@ -367,6 +464,10 @@ def main():
             results = searcher.search(
                 args.query, limit=args.limit, source=args.source,
                 subagents=args.subagents,
+                semantic_search=not args.no_semantic,
+                recency=not args.no_recency,
+                days=args.days,
+                half_life=args.half_life,
             )
             if not results:
                 print(f"No results for: {args.query}")

@@ -183,6 +183,20 @@ TOOL_TOKEN_FIELDS = ("write_tokens", "inject_tokens", "result_bytes")
 DETAIL_FIELDS = TOOL_TOKEN_FIELDS + ("use_count",)
 _MCP_PREFIX_RE = re.compile(r"^mcp__(?P<server>.+?)__(?P<tool>.+)$")
 
+MAX_TOOL_RESULT_CHARS = 2_000
+MAX_TOOL_ARG_CHARS = 400
+MAX_TOOL_SCAN_CHARS = 200_000
+MAX_TOOL_DIGEST_CHARS = 2_000_000
+MAX_ERROR_LINES = 20
+_DIGEST_ARG_KEYS = (
+    "command", "file_path", "path", "notebook_path", "pattern", "glob",
+    "query", "url", "description", "prompt", "subagent_type", "skill",
+)
+_ERROR_LINE_RE = re.compile(
+    r"(?im)^.*\b(?:error|traceback|exception|failed|failure|fatal|denied"
+    r"|refused|timeout|not found|no such)\b.*$"
+)
+
 
 def canonical_tool_name(name: str) -> str:
     """Collapse per-harness MCP spellings onto one <server>.<tool> name.
@@ -215,6 +229,84 @@ def _tool_result_size(value) -> int:
             for part in value
         )
     return len(str(value or ""))
+
+
+def _tool_result_text(value) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(
+            (part.get("text") or "") if isinstance(part, dict) else str(part)
+            for part in value
+        )
+    return str(value or "")
+
+
+def _mcp_result_text(result) -> str:
+    if isinstance(result, dict):
+        for key in ("Ok", "Err", "ok", "err"):
+            if key in result:
+                return _mcp_result_text(result[key])
+        if "content" in result:
+            return _tool_result_text(result["content"])
+    return _tool_result_text(result)
+
+
+def _tool_call_digest(name: str, tool_input) -> str:
+    """One searchable line naming what a tool call acted on.
+
+    Values are what make a call findable later — the command that ran, the file
+    that was read, the URL fetched — so they are kept while bulk payloads
+    (file contents on Write, diffs on Edit) are dropped by the length cap.
+    """
+    if not isinstance(tool_input, dict):
+        return f"[{name}]"
+    parts = []
+    for key in _DIGEST_ARG_KEYS:
+        value = tool_input.get(key)
+        if isinstance(value, list):
+            value = " ".join(str(item) for item in value)
+        if isinstance(value, str) and value.strip():
+            parts.append(f"{key}={sanitize_text(value, MAX_TOOL_ARG_CHARS)}")
+    return f"[{name}] " + " ".join(parts) if parts else f"[{name}]"
+
+
+def _codex_call_args(payload: dict) -> dict:
+    """codex serializes tool arguments as a JSON string on the call item."""
+    arguments = payload.get("arguments")
+    if isinstance(arguments, dict):
+        return arguments
+    if not isinstance(arguments, str):
+        return {}
+    try:
+        parsed = json.loads(arguments)
+    except (json.JSONDecodeError, TypeError):
+        return {"command": arguments}
+    return parsed if isinstance(parsed, dict) else {"command": arguments}
+
+
+def _tool_result_digest(text: str) -> str:
+    """Head of a tool result plus any error lines that fell past the head.
+
+    Errors are what a later search is usually hunting for and they surface at
+    the end of long output, which the head cap would otherwise cut.
+    """
+    text = sanitize_text(text, MAX_TOOL_SCAN_CHARS) if text else ""
+    if not text:
+        return ""
+    head = text[:MAX_TOOL_RESULT_CHARS]
+    if len(text) <= MAX_TOOL_RESULT_CHARS:
+        return head
+    tail_errors = _ERROR_LINE_RE.findall(text[MAX_TOOL_RESULT_CHARS:])
+    if not tail_errors:
+        return head
+    kept = "\n".join(line.strip()[:MAX_TOOL_ARG_CHARS] for line in tail_errors[:MAX_ERROR_LINES])
+    return f"{head}\n{kept}"
+
+
+def _build_digest(parts: list[str]) -> str:
+    digest = "\n".join(part for part in parts if part)
+    return digest[:MAX_TOOL_DIGEST_CHARS]
 
 
 _SUBCOMMAND_DRIVERS = frozenset((
@@ -384,6 +476,20 @@ def _codex_usage(model: str | None, totals: dict, turns: int) -> dict:
 def _build_fts(messages: list[str]) -> str:
     content = "\n".join(part for part in messages if part)
     return content[:MAX_FTS_CHARS]
+
+
+def _combine_fts(messages: list[str], tool_messages: list[str]) -> tuple[str, int]:
+    """Prose first, then the tool digest, with the boundary reported.
+
+    The semantic index embeds only the prose half; tool output is lexical
+    territory (error strings, paths, PR numbers) and embedding it would
+    quadruple the vector count for signal BM25 already handles.
+    """
+    prose = _build_fts(messages)
+    digest = _build_digest(tool_messages)
+    if not digest:
+        return prose, len(prose)
+    return f"{prose}\n{digest}", len(prose)
 
 
 def _pair_entries(entries: list[dict], query: str | None, limit: int,
@@ -559,6 +665,7 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
         project_name = self.project_names.get(project, project)
         user_prompts: list[str] = []
         fts_messages: list[str] = []
+        tool_messages: list[str] = []
         tools: dict[str, int] = {}
         agents: dict[str, int] = {}
         summaries: list[str] = []
@@ -628,16 +735,30 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
                 for tool_name in tool_names:
                     tools[tool_name] = tools.get(tool_name, 0) + 1
 
-                if entry_type == "assistant":
-                    for block in message.get("content", []) if isinstance(message.get("content"), list) else []:
-                        if not isinstance(block, dict) or block.get("type") != "tool_use":
-                            continue
+                content = message.get("content")
+                blocks = content if isinstance(content, list) else []
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        continue
+                    block_type = block.get("type")
+                    if entry_type == "assistant" and block_type == "tool_use":
+                        tool_input = block.get("input") or {}
+                        tool_messages.append(_tool_call_digest(
+                            canonical_tool_name(
+                                sanitize_text(block.get("name", ""), 200)
+                            ),
+                            tool_input,
+                        ))
                         if block.get("name") == "Task":
                             agent = sanitize_text(
-                                (block.get("input") or {}).get("subagent_type", ""), 200
+                                tool_input.get("subagent_type", ""), 200
                             )
                             if agent:
                                 agents[agent] = agents.get(agent, 0) + 1
+                    elif entry_type == "user" and block_type == "tool_result":
+                        tool_messages.append(_tool_result_digest(
+                            _tool_result_text(block.get("content"))
+                        ))
 
         if not title_display and summaries:
             title_display = summaries[0][:80]
@@ -654,6 +775,7 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
             "captured_at": end_time or datetime.now().isoformat(),
             "exchange_number": None,
         } for summary in summaries]
+        fts_content, prose_chars = _combine_fts(fts_messages, tool_messages)
 
         return {
             "source": self.source,
@@ -681,7 +803,8 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
             "tool_details": tool_tokens.details,
             "agents": agents,
             "usage": usage,
-            "fts_content": _build_fts(fts_messages),
+            "fts_content": fts_content,
+            "prose_chars": prose_chars,
             "topics": topics,
         }
 
@@ -741,6 +864,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
         turns = 0
         previous_turn = None
         tool_tokens = _ToolTokens()
+        tool_messages: list[str] = []
         # one MCP call emits a function_call and an mcp_tool_call_end sharing a call_id
         codex_calls: dict[str, dict] = {}
 
@@ -807,6 +931,9 @@ class CodexSourceAdapter(SessionSourceAdapter):
                         )
                         if not record["canonical"]:
                             record["name"] = name
+                        tool_messages.append(
+                            _tool_call_digest(name, _codex_call_args(payload))
+                        )
                     agent = _tool_agent_name(payload)
                     if agent:
                         agents[agent] = agents.get(agent, 0) + 1
@@ -816,6 +943,9 @@ class CodexSourceAdapter(SessionSourceAdapter):
                         record["result_bytes"] += _tool_result_size(
                             payload.get("output")
                         )
+                        tool_messages.append(_tool_result_digest(
+                            _tool_result_text(payload.get("output"))
+                        ))
                 # reasoning, tool outputs, and developer/system messages are
                 # intentionally excluded.
             elif (
@@ -865,6 +995,9 @@ class CodexSourceAdapter(SessionSourceAdapter):
                     record["result_bytes"] += _mcp_result_size(
                         payload.get("result")
                     )
+                    tool_messages.append(_tool_result_digest(
+                        _mcp_result_text(payload.get("result"))
+                    ))
 
         # review/exec subagent rollouts carry their turns only as events
         if not fts_messages:
@@ -886,6 +1019,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
                 record["result_bytes"]
             )
 
+        fts_content, prose_chars = _combine_fts(fts_messages, tool_messages)
         project = cwd or path.parent.name
         project_name = Path(cwd).name if cwd else path.parent.name
         title = _pick_title(user_prompts)
@@ -920,7 +1054,8 @@ class CodexSourceAdapter(SessionSourceAdapter):
             "tool_details": tool_tokens.details,
             "agents": agents,
             "usage": _codex_usage(model, best_usage, turns),
-            "fts_content": _build_fts(fts_messages),
+            "fts_content": fts_content,
+            "prose_chars": prose_chars,
             "topics": topics,
         }
 

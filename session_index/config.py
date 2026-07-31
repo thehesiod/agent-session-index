@@ -18,6 +18,9 @@ DEFAULTS = {
     "topics_dir": str(Path.home() / ".claude" / "session-topics"),
     "clients": [],
     "project_names": {},
+    "embed_model": "minishlab/potion-base-32M",
+    "recency_half_life_days": 90,
+    "recency_weight": 0.5,
     "sources": {
         "claude": {
             "enabled": True,
@@ -177,6 +180,20 @@ def get_topics_dir(override: str = None) -> Path:
     if override:
         return Path(override).expanduser()
     return Path(get_config()["topics_dir"]).expanduser()
+
+
+def get_embed_model() -> str:
+    return get_config().get("embed_model") or DEFAULTS["embed_model"]
+
+
+def get_recency_half_life() -> float:
+    value = get_config().get("recency_half_life_days")
+    return float(value) if value else float(DEFAULTS["recency_half_life_days"])
+
+
+def get_recency_weight() -> float:
+    value = get_config().get("recency_weight")
+    return float(DEFAULTS["recency_weight"]) if value is None else float(value)
 
 
 def get_clients() -> list[str]:

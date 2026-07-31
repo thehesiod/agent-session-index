@@ -68,16 +68,21 @@ class AdapterTests(unittest.TestCase):
             "linear.get_issue": 1,
         })
         self.assertIn("amber-needle", data["fts_content"])
+        # tool output is indexed as a digest, after the prose boundary
+        self.assertIn("forbidden-tool-output", data["fts_content"])
+        self.assertIn("forbidden-mcp-result", data["fts_content"])
+        self.assertLess(data["prose_chars"], len(data["fts_content"]))
+        self.assertNotIn(
+            "forbidden-tool-output", data["fts_content"][:data["prose_chars"]]
+        )
         for forbidden in (
             "forbidden-codex-developer",
             "forbidden-codex-base-instructions",
             "forbidden-encrypted-reasoning",
             "forbidden-reasoning-summary",
-            "forbidden-tool-output",
             "huge-binary-tool-payload",
             "forbidden-environment-context",
             "forbidden-mcp-arguments",
-            "forbidden-mcp-result",
         ):
             self.assertNotIn(forbidden, data["fts_content"])
         metadata = json.loads(data["metadata_json"])

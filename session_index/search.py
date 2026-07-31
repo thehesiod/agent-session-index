@@ -9,9 +9,17 @@ from pathlib import Path
 
 try:
     from . import config
+    from . import semantic
 except ImportError:
     import config
+    import semantic
 
+RRF_K = 60
+# Static embeddings collapse rare identifiers onto subwords, so narrower queries stay FTS-only
+MIN_SEMANTIC_QUERY_TOKENS = 3
+SNIPPET_MAX_DOC_CHARS = 200_000
+SNIPPET_SCAN_CHARS = 2_000_000
+EXCERPT_RADIUS = 60
 VALID_SOURCES = ("claude", "codex")
 SUBAGENT_MODES = ("include", "exclude", "only")
 USAGE_GROUPINGS = {
@@ -52,6 +60,61 @@ def _escape_fts_query(query: str) -> str:
                 index += 1
             tokens.append(f'"{chars[start:index]}"')
     return " ".join(tokens)
+
+
+def _excerpt(content: str, terms: list[str]) -> str:
+    """Cheap stand-in for snippet() on documents too large to rescan."""
+    lowered = content.lower()
+    for term in terms:
+        found = lowered.find(term)
+        if found != -1:
+            start = max(found - EXCERPT_RADIUS, 0)
+            return content[start:found + len(term) + EXCERPT_RADIUS]
+    return content[:EXCERPT_RADIUS * 2]
+
+
+def _recency_factor(start_time: str | None, half_life: float,
+                    weight: float) -> float:
+    """Half-life decay applied as a bounded multiplier on the fused score.
+
+    Multiplicative and capped so it reorders near-ties without burying a
+    strongly-relevant old session under a weakly-relevant fresh one.
+    """
+    if not start_time or weight <= 0 or half_life <= 0:
+        return 1.0
+    try:
+        started = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+    except ValueError:
+        return 1.0
+    now = datetime.now(started.tzinfo) if started.tzinfo else datetime.now()
+    age_days = max((now - started).total_seconds() / 86400.0, 0.0)
+    return 1.0 + weight * (0.5 ** (age_days / half_life))
+
+
+def _mark_superseded(results: list[dict]) -> list[dict]:
+    """Flag older results whose project and topic a newer result repeats.
+
+    Exact normalized topic match only - a topic string is already a model-written
+    summary of what the session was about, so repeating one in the same project
+    is a real signal. No fuzzy matching, so this never silently drops a result.
+    """
+    seen: dict[tuple[str, str], str] = {}
+    ordered = sorted(
+        results,
+        key=lambda item: item.get("start_time") or "",
+        reverse=True,
+    )
+    for result in ordered:
+        project = (result.get("project_name") or "").strip().lower()
+        for topic in result.get("topics") or []:
+            key = (project, (topic.get("topic") or "").strip().lower())
+            if not key[1]:
+                continue
+            if key in seen and seen[key] != result["session_id"]:
+                result["superseded_by"] = seen[key]
+                break
+            seen.setdefault(key, result["session_id"])
+    return results
 
 
 def resume_command(source: str, session_id: str) -> str:
@@ -105,28 +168,134 @@ class SessionSearch:
             return f"{alias}.parent_session_id IS NOT NULL"
         return "1=1"
 
+    def _lexical(self, query: str, limit: int, source: str | None,
+                 subagents: str, days: int | None) -> list[dict]:
+        source_clause, source_params = self._source_condition(source)
+        conditions = [
+            "session_content MATCH ?", source_clause,
+            self._subagent_condition(subagents),
+        ]
+        params: list = [_escape_fts_query(query), *source_params]
+        if days:
+            conditions.append("s.start_time >= ?")
+            params.append((datetime.now() - timedelta(days=days)).isoformat())
+        params.append(limit)
+        statement = (
+            "SELECT s.source, s.session_id, s.parent_session_id, s.agent_name, "
+            "s.project_name, s.title, s.title_display, s.client, s.tags, "
+            "s.exchange_count, s.start_time, s.duration_minutes, "
+            "s.has_compaction, s.content_chars "
+            "FROM session_content "
+            "JOIN sessions s ON s.source = session_content.source "
+            "AND s.session_id = session_content.session_id "
+            "WHERE " + " AND ".join(conditions) + " ORDER BY rank LIMIT ?"
+        )
+        return [dict(row) for row in self.conn.execute(statement, params)]
+
+    def _attach_snippets(self, query: str, results: list[dict]) -> list[dict]:
+        """Snippet only what will be displayed, and only where it is cheap.
+
+        snippet() rescans the whole document to locate the match, so its cost
+        tracks document size - seconds each on the few multi-megabyte sessions.
+        Those fall back to a literal scan of a bounded prefix instead.
+        """
+        if not results:
+            return results
+        match = _escape_fts_query(query)
+        terms = [term.strip('"').lower() for term in match.split() if term]
+        for result in results:
+            if (result.get("content_chars") or 0) <= SNIPPET_MAX_DOC_CHARS:
+                row = self.conn.execute(
+                    "SELECT snippet(session_content, 2, '>>>', '<<<', '...', 40) "
+                    "FROM session_content "
+                    "WHERE session_content MATCH ? "
+                    "AND source = ? AND session_id = ?",
+                    (match, result["source"], result["session_id"]),
+                ).fetchone()
+                if row:
+                    result["snippet"] = row[0]
+                continue
+            row = self.conn.execute(
+                "SELECT substr(content, 1, ?) FROM session_content "
+                "WHERE source = ? AND session_id = ?",
+                (SNIPPET_SCAN_CHARS, result["source"], result["session_id"]),
+            ).fetchone()
+            if row:
+                result["snippet"] = _excerpt(row[0] or "", terms)
+        return results
+
+    def _hydrate(self, source: str, session_id: str) -> dict | None:
+        row = self.conn.execute("""
+            SELECT s.source, s.session_id, s.parent_session_id, s.agent_name,
+                   s.project_name, s.title, s.title_display, s.client, s.tags,
+                   s.exchange_count, s.start_time, s.duration_minutes,
+                   s.has_compaction, s.content_chars
+            FROM sessions s WHERE s.source=? AND s.session_id=?
+        """, (source, session_id)).fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def _passes_filters(row: dict, source: str | None, subagents: str,
+                        days: int | None) -> bool:
+        if source and row.get("source") != source:
+            return False
+        if subagents == "exclude" and row.get("parent_session_id"):
+            return False
+        if subagents == "only" and not row.get("parent_session_id"):
+            return False
+        if days:
+            cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+            if (row.get("start_time") or "") < cutoff:
+                return False
+        return True
+
     def search(self, query: str, limit: int = 20,
                source: str | None = None,
-               subagents: str = "include") -> list[dict]:
-        source_clause, source_params = self._source_condition(source)
-        subagent_clause = self._subagent_condition(subagents)
-        rows = self.conn.execute(f"""
-            SELECT s.source, s.session_id, s.parent_session_id, s.agent_name,
-                   s.project_name, s.title,
-                   s.title_display, s.client, s.tags, s.exchange_count,
-                   s.start_time, s.duration_minutes, s.has_compaction,
-                   snippet(session_content, 2, '>>>', '<<<', '...', 40)
-                       AS snippet
-            FROM session_content
-            JOIN sessions s
-              ON s.source = session_content.source
-             AND s.session_id = session_content.session_id
-            WHERE session_content MATCH ? AND {source_clause}
-              AND {subagent_clause}
-            ORDER BY rank
-            LIMIT ?
-        """, [_escape_fts_query(query), *source_params, limit]).fetchall()
-        return [self._with_topics(row) for row in rows]
+               subagents: str = "include",
+               semantic_search: bool = True,
+               recency: bool = True,
+               days: int | None = None,
+               half_life: float | None = None) -> list[dict]:
+        """FTS and vector hits fused by reciprocal rank, then recency-decayed."""
+        pool = max(limit * 5, 50)
+        lexical = self._lexical(query, pool, source, subagents, days)
+        dense: list[tuple[str, str, float]] = []
+        if semantic_search and len(query.split()) >= MIN_SEMANTIC_QUERY_TOKENS:
+            index = semantic.SemanticIndex(self.conn)
+            if index.enabled and semantic.available():
+                try:
+                    dense = index.search(query, pool)
+                except sqlite3.Error:
+                    dense = []
+
+        scores: dict[tuple[str, str], float] = {}
+        rows: dict[tuple[str, str], dict] = {}
+        for rank, row in enumerate(lexical):
+            key = (row["source"], row["session_id"])
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
+            rows[key] = row
+        for rank, (hit_source, session_id, _) in enumerate(dense):
+            key = (hit_source, session_id)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (RRF_K + rank + 1)
+
+        weight = config.get_recency_weight() if recency else 0.0
+        decay = (
+            half_life if half_life is not None
+            else config.get_recency_half_life()
+        )
+        fused = []
+        for key, score in scores.items():
+            row = rows.get(key) or self._hydrate(*key)
+            if not row or not self._passes_filters(row, source, subagents, days):
+                continue
+            row["score"] = score * _recency_factor(
+                row.get("start_time"), decay, weight
+            )
+            fused.append(row)
+        fused.sort(key=lambda item: item["score"], reverse=True)
+        return _mark_superseded(self._attach_snippets(query, [
+            self._with_topics_dict(row) for row in fused[:limit]
+        ]))
 
     def find(
         self,
@@ -414,7 +583,9 @@ class SessionSearch:
         return [dict(row) for row in rows]
 
     def _with_topics(self, row: sqlite3.Row) -> dict:
-        result = dict(row)
+        return self._with_topics_dict(dict(row))
+
+    def _with_topics_dict(self, result: dict) -> dict:
         result["topics"] = self._get_topics(
             result["source"], result["session_id"]
         )
@@ -458,6 +629,10 @@ def format_result(result: dict, show_topics: bool = True) -> str:
         meta.append(f"{result['duration_minutes']}min")
     if result.get("has_compaction"):
         meta.append("compacted")
+    if result.get("superseded_by"):
+        meta.append(
+            f"superseded by {result['superseded_by'].removeprefix('agent-')[:8]}"
+        )
     if meta:
         lines.append(f"    {' · '.join(meta)}")
     if result.get("snippet"):

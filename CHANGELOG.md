@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.5.0
+
+- Index a digest of tool activity, not just prose. Every tool call contributes its
+  identifying arguments (command, file path, URL, pattern) and every result contributes
+  its first 2KB plus any error lines that fell past that head. Previously only user and
+  assistant prose was indexed, roughly 2.7% of transcript bytes, so a PR number that
+  only ever appeared in `gh pr view` output was unfindable. Bulk payloads still drop out
+  via the argument length cap, and the whole digest is capped at 2MB per session.
+- Add an optional dense-vector layer behind the `semantic` extra, so paraphrases match
+  where no keyword does. Chunks of prose are embedded with model2vec and stored in
+  sqlite-vec; `sessions embed` builds or refreshes the layer and is resumable. Without
+  the extra the package stays stdlib-only and search falls back to FTS alone.
+- Fuse keyword and vector rankings by reciprocal rank rather than picking one. Only the
+  prose half is embedded — tool output is lexical territory, and embedding it would
+  quadruple the vector count for signal BM25 already handles. `sessions` gains
+  `--no-semantic` to opt out.
+- Reject dense hits past a cosine distance floor. Nearest-neighbour search always
+  returns neighbours, so without a floor an unrelated query got confident nonsense
+  instead of no results. Queries under three words skip the vector layer entirely, since
+  static embeddings smear a rare identifier onto its subwords and pull in look-alikes.
+- Decay the fused score by session age with a 90-day half-life, so a fresh session wins
+  a near-tie without burying a strongly-relevant old one. `--no-recency`, `--half-life`,
+  and `--days` tune or disable it; `recency_half_life_days` and `recency_weight` set the
+  defaults in config.
+- Mark, never drop, a result that a newer session in the same project supersedes on an
+  identical topic. Search had no notion of time at all, so a stale answer and its
+  correction ranked purely on term frequency.
+- `sessions` gains a `prose_chars` column recording where prose ends and the tool digest
+  begins, so the vector layer can embed one half without re-parsing.
+
 ## 0.4.5
 
 - Canonicalize MCP tool names to `<server>.<tool>`. Claude's `mcp__server__tool` and
