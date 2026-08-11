@@ -958,14 +958,15 @@ class CodexSourceAdapter(SessionSourceAdapter):
                 session_id = payload.get("id") or session_id
                 cwd = payload.get("cwd") or cwd
                 start_time = payload.get("timestamp") or start_time
-                parent_session_id = sanitize_text(
-                    payload.get("parent_thread_id")
-                    or payload.get("forked_from_id") or "", 200
-                ) or None
                 agent_name = sanitize_text(
                     payload.get("agent_role")
                     or payload.get("agent_nickname") or "", 200
                 ) or None
+                # a plain `codex fork` resumes independently, so ancestry != delegation
+                parent = payload.get("parent_thread_id") or (
+                    payload.get("forked_from_id") if agent_name else None
+                )
+                parent_session_id = sanitize_text(parent or "", 200) or None
                 for key in (
                     "originator", "model_provider", "git", "thread_source",
                     "parent_thread_id", "forked_from_id", "agent_nickname",

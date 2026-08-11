@@ -221,6 +221,12 @@ class AdapterTests(unittest.TestCase):
                 "payload": {"id": "child-2", "cwd": "/Users/test/demo",
                             "forked_from_id": "parent-2"},
             }) + "\n")
+            (root / "agent-fork.jsonl").write_text(json.dumps({
+                "timestamp": "2026-01-02T11:00:00Z", "type": "session_meta",
+                "payload": {"id": "child-3", "cwd": "/Users/test/demo",
+                            "forked_from_id": "parent-3",
+                            "agent_role": "explorer"},
+            }) + "\n")
             (root / "named.jsonl").write_text("\n".join(json.dumps(r) for r in [
                 {"timestamp": "2026-01-02T11:00:00Z", "type": "session_meta",
                  "payload": {"id": "named-1", "cwd": "/Users/test/demo"}},
@@ -231,15 +237,22 @@ class AdapterTests(unittest.TestCase):
 
             delegated = CodexSourceAdapter(root).parse(root / "delegated.jsonl")
             forked = CodexSourceAdapter(root).parse(root / "forked.jsonl")
+            agent_fork = CodexSourceAdapter(root).parse(root / "agent-fork.jsonl")
             named = CodexSourceAdapter(root).parse(root / "named.jsonl")
 
         # --subagents filters on parent_session_id, which codex never populated
         self.assertEqual(delegated["parent_session_id"], "parent-1")
         self.assertEqual(delegated["agent_name"], "explorer")
         self.assertEqual(delegated["title"], "explorer subagent")
-        # a fork records its origin under a different key
-        self.assertEqual(forked["parent_session_id"], "parent-2")
+        # a plain `codex fork` resumes on its own id; linking it said "resume <parent>"
+        self.assertIsNone(forked["parent_session_id"])
         self.assertIsNone(forked["agent_name"])
+        self.assertEqual(
+            json.loads(forked["metadata_json"])["forked_from_id"], "parent-2"
+        )
+        # ...but a fork carrying an agent identity is a delegated rollout
+        self.assertEqual(agent_fork["parent_session_id"], "parent-3")
+        self.assertEqual(agent_fork["agent_name"], "explorer")
         # a renamed thread is codex's equivalent of a custom title
         self.assertEqual(named["title"], "Find the Sequin branch")
         self.assertIsNone(named["parent_session_id"])
