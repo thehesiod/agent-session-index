@@ -13,12 +13,14 @@ from typing import Optional
 
 try:
     from . import config
+    from . import semantic
     from .sources import build_adapters
 except ImportError:
     import config
+    import semantic
     from sources import build_adapters
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 VALID_SOURCES = ("claude", "codex")
 
 
@@ -29,8 +31,12 @@ class SessionIndexer:
         projects_dir: Path = None,
         codex_sessions_dir: Path = None,
         source_configs: dict | None = None,
+        embed: bool = True,
     ):
         self.db_path = Path(db_path) if db_path else config.get_db_path()
+        self.embed_enabled = embed
+        # False means "not yet resolved"; None means "resolved to unavailable"
+        self._semantic: object = False
         overrides = dict(source_configs or {})
         if projects_dir:
             overrides["claude"] = {
@@ -90,23 +96,68 @@ class SessionIndexer:
             self._migrate_v1()
         else:
             self._create_v2_tables()
-            # Support databases created by early multi-source development
-            # snapshots without requiring a destructive rebuild.
-            columns = self._columns("sessions")
-            if "cwd" not in columns:
-                self.conn.execute("ALTER TABLE sessions ADD COLUMN cwd TEXT")
-            if "metadata_json" not in columns:
+        # both paths: _migrate_v1 rebuilds sessions from the v1 column list, so
+        # it lands here missing every column added after v2
+        self._add_missing_columns()
+        self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_parent "
+            "ON sessions(source, parent_session_id)"
+        )
+        self._sweep_orphans()
+        self.conn.commit()
+
+    def _add_missing_columns(self):
+        """Add columns introduced after schema v2 to an existing database."""
+        columns = self._columns("sessions")
+        for name, definition in (
+            ("cwd", "TEXT"),
+            ("metadata_json", "TEXT"),
+            ("parent_session_id", "TEXT"),
+            ("agent_name", "TEXT"),
+            ("prose_chars", "INTEGER DEFAULT 0"),
+            ("content_chars", "INTEGER DEFAULT 0"),
+        ):
+            if name not in columns:
                 self.conn.execute(
-                    "ALTER TABLE sessions ADD COLUMN metadata_json TEXT"
+                    f"ALTER TABLE sessions ADD COLUMN {name} {definition}"
                 )
-            self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            self.conn.commit()
+        if "cache_write_5m_tokens" not in self._columns("session_usage"):
+            self.conn.execute(
+                "ALTER TABLE session_usage "
+                "ADD COLUMN cache_write_5m_tokens INTEGER DEFAULT 0"
+            )
+        tool_columns = self._columns("session_tools")
+        for name in ("write_tokens", "inject_tokens", "result_bytes"):
+            if name not in tool_columns:
+                self.conn.execute(
+                    f"ALTER TABLE session_tools "
+                    f"ADD COLUMN {name} INTEGER DEFAULT 0"
+                )
+
+    def _sweep_orphans(self):
+        """Drop derived rows whose session row is gone.
+
+        The v1 migration ran with foreign_keys=OFF, which left child rows behind
+        and inflated any aggregate that does not join sessions. Only rebuildable
+        counts are swept; session_content is left alone because its text may be
+        the last copy of a reaped transcript.
+        """
+        for table in ("session_tools", "session_tool_detail", "session_agents",
+                      "session_topics", "session_usage"):
+            self.conn.execute(
+                "DELETE FROM " + table + " AS c WHERE NOT EXISTS ("
+                "SELECT 1 FROM sessions s WHERE s.source = c.session_source "
+                "AND s.session_id = c.session_id)"
+            )
 
     def _create_v2_tables(self):
         statements = (
             """CREATE TABLE IF NOT EXISTS sessions (
                 source TEXT NOT NULL,
                 session_id TEXT NOT NULL,
+                parent_session_id TEXT,
+                agent_name TEXT,
                 project TEXT,
                 project_name TEXT,
                 cwd TEXT,
@@ -144,6 +195,9 @@ class SessionIndexer:
                 session_id TEXT NOT NULL,
                 tool_name TEXT NOT NULL,
                 use_count INTEGER DEFAULT 0,
+                write_tokens INTEGER DEFAULT 0,
+                inject_tokens INTEGER DEFAULT 0,
+                result_bytes INTEGER DEFAULT 0,
                 PRIMARY KEY (session_source, session_id, tool_name),
                 FOREIGN KEY (session_source, session_id)
                     REFERENCES sessions(source, session_id) ON DELETE CASCADE
@@ -157,6 +211,35 @@ class SessionIndexer:
                 FOREIGN KEY (session_source, session_id)
                     REFERENCES sessions(source, session_id) ON DELETE CASCADE
             )""",
+            """CREATE TABLE IF NOT EXISTS session_tool_detail (
+                session_source TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                use_count INTEGER DEFAULT 0,
+                write_tokens INTEGER DEFAULT 0,
+                inject_tokens INTEGER DEFAULT 0,
+                result_bytes INTEGER DEFAULT 0,
+                PRIMARY KEY (session_source, session_id, tool_name, detail),
+                FOREIGN KEY (session_source, session_id)
+                    REFERENCES sessions(source, session_id) ON DELETE CASCADE
+            )""",
+            """CREATE TABLE IF NOT EXISTS session_usage (
+                session_source TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                calls INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                cache_write_1h_tokens INTEGER DEFAULT 0,
+                cache_write_5m_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                PRIMARY KEY (session_source, session_id, model),
+                FOREIGN KEY (session_source, session_id)
+                    REFERENCES sessions(source, session_id) ON DELETE CASCADE
+            )""",
             """CREATE TABLE IF NOT EXISTS index_state (
                 source TEXT PRIMARY KEY,
                 initialized_at TEXT NOT NULL
@@ -165,6 +248,9 @@ class SessionIndexer:
             "CREATE INDEX IF NOT EXISTS idx_sessions_client ON sessions(client)",
             "CREATE INDEX IF NOT EXISTS idx_sessions_start ON sessions(start_time)",
             "CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source)",
+            "CREATE INDEX IF NOT EXISTS idx_usage_model ON session_usage(model)",
+            "CREATE INDEX IF NOT EXISTS idx_detail_tool "
+            "ON session_tool_detail(tool_name, detail)",
             "CREATE INDEX IF NOT EXISTS idx_topics_session "
             "ON session_topics(session_source, session_id)",
             "CREATE INDEX IF NOT EXISTS idx_topics_source ON session_topics(source)",
@@ -347,6 +433,71 @@ class SessionIndexer:
         data = self._parse_session(path, name)
         return bool(data and self._upsert_session(data))
 
+    def _semantic_index(self):
+        """Lazily attach the vector index; None whenever the extra is absent."""
+        if self._semantic is not False:
+            return self._semantic
+        self._semantic = None
+        if not self.embed_enabled or not semantic.available():
+            return None
+        index = semantic.SemanticIndex(self.conn)
+        if not index.enabled:
+            return None
+        try:
+            index.ensure_schema(semantic.model_dims())
+        except semantic.SemanticUnavailable as exc:
+            print(f"Semantic index disabled: {exc}", file=sys.stderr)
+            return None
+        self._semantic = index
+        return index
+
+    def _embed_session(self, identity: tuple[str, str], data: dict):
+        index = self._semantic_index()
+        if index is None:
+            # the prose changed but its vectors did not, so drop them rather
+            # than let hybrid search keep matching the previous content
+            self._drop_stale_vectors(identity)
+            return
+        # Only the prose half is embedded; the tool digest is lexical territory
+        prose = (data.get("fts_content") or "")[:data.get("prose_chars") or 0]
+        try:
+            index.index_session(*identity, prose)
+        except (sqlite3.Error, semantic.SemanticUnavailable) as exc:
+            self._drop_stale_vectors(identity)
+            print(
+                f"Embedding failed for {identity[0]}:{identity[1]}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _drop_stale_vectors(self, identity: tuple[str, str]):
+        """Remove chunks for a session whose prose was re-indexed without embedding."""
+        if not self._table_exists("session_chunks"):
+            return
+        try:
+            rows = self.conn.execute(
+                "SELECT chunk_id FROM session_chunks "
+                "WHERE source = ? AND session_id = ?",
+                identity,
+            ).fetchall()
+            if not rows:
+                return
+            if self._table_exists("session_vectors"):
+                for row in rows:
+                    self.conn.execute(
+                        "DELETE FROM session_vectors WHERE chunk_id = ?",
+                        (row[0],),
+                    )
+            self.conn.execute(
+                "DELETE FROM session_chunks WHERE source = ? AND session_id = ?",
+                identity,
+            )
+        except sqlite3.Error as exc:
+            print(
+                f"Could not clear stale vectors for "
+                f"{identity[0]}:{identity[1]}: {exc}",
+                file=sys.stderr,
+            )
+
     def _upsert_session(self, data: dict) -> bool:
         try:
             now = datetime.now().isoformat()
@@ -358,6 +509,9 @@ class SessionIndexer:
                 data["start_time"], data["end_time"], data["duration_minutes"],
                 data["model"], data["has_compaction"],
                 data.get("metadata_json"), now, now, data["file_hash"],
+                data.get("parent_session_id"), data.get("agent_name"),
+                data.get("prose_chars") or 0,
+                len(data.get("fts_content") or ""),
             )
             self.conn.execute("""
                 INSERT INTO sessions (
@@ -365,11 +519,15 @@ class SessionIndexer:
                     title_display, tags, client, file_path, file_size,
                     exchange_count, start_time, end_time, duration_minutes,
                     model, has_compaction, metadata_json, indexed_at,
-                    last_modified, file_hash
+                    last_modified, file_hash, parent_session_id, agent_name,
+                    prose_chars, content_chars
                 ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(source, session_id) DO UPDATE SET
+                    parent_session_id=excluded.parent_session_id,
+                    agent_name=excluded.agent_name,
                     project=excluded.project,
                     project_name=excluded.project_name,
                     cwd=excluded.cwd,
@@ -388,7 +546,9 @@ class SessionIndexer:
                     metadata_json=excluded.metadata_json,
                     indexed_at=excluded.indexed_at,
                     last_modified=excluded.last_modified,
-                    file_hash=excluded.file_hash
+                    file_hash=excluded.file_hash,
+                    prose_chars=excluded.prose_chars,
+                    content_chars=excluded.content_chars
             """, values)
 
             identity = (data["source"], data["session_id"])
@@ -396,12 +556,57 @@ class SessionIndexer:
                 "DELETE FROM session_tools "
                 "WHERE session_source=? AND session_id=?", identity
             )
-            for tool, count in data["tools"].items():
+            tool_tokens = data.get("tool_tokens") or {}
+            for tool in set(data["tools"]) | set(tool_tokens):
+                counts = tool_tokens.get(tool) or {}
                 self.conn.execute("""
                     INSERT INTO session_tools (
-                        session_source, session_id, tool_name, use_count
-                    ) VALUES (?, ?, ?, ?)
-                """, (*identity, tool, count))
+                        session_source, session_id, tool_name, use_count,
+                        write_tokens, inject_tokens, result_bytes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    *identity, tool, data["tools"].get(tool, 0),
+                    counts.get("write_tokens", 0),
+                    counts.get("inject_tokens", 0),
+                    counts.get("result_bytes", 0),
+                ))
+
+            self.conn.execute(
+                "DELETE FROM session_tool_detail "
+                "WHERE session_source=? AND session_id=?", identity
+            )
+            for (tool, detail), counts in (data.get("tool_details") or {}).items():
+                self.conn.execute("""
+                    INSERT INTO session_tool_detail (
+                        session_source, session_id, tool_name, detail,
+                        use_count, write_tokens, inject_tokens, result_bytes
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    *identity, tool, detail, counts["use_count"],
+                    counts["write_tokens"], counts["inject_tokens"],
+                    counts["result_bytes"],
+                ))
+
+            self.conn.execute(
+                "DELETE FROM session_usage "
+                "WHERE session_source=? AND session_id=?", identity
+            )
+            for model, counts in (data.get("usage") or {}).items():
+                self.conn.execute("""
+                    INSERT INTO session_usage (
+                        session_source, session_id, model, calls,
+                        input_tokens, output_tokens, cache_write_tokens,
+                        cache_write_1h_tokens, cache_write_5m_tokens,
+                        cache_read_tokens, reasoning_tokens
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    *identity, model, counts["calls"],
+                    counts["input_tokens"], counts["output_tokens"],
+                    counts["cache_write_tokens"],
+                    counts["cache_write_1h_tokens"],
+                    counts["cache_write_5m_tokens"],
+                    counts["cache_read_tokens"], counts["reasoning_tokens"],
+                ))
 
             self.conn.execute(
                 "DELETE FROM session_agents "
@@ -423,6 +628,7 @@ class SessionIndexer:
                     INSERT INTO session_content (source, session_id, content)
                     VALUES (?, ?, ?)
                 """, (*identity, data["fts_content"]))
+            self._embed_session(identity, data)
 
             for topic in data["topics"]:
                 existing = self.conn.execute("""
@@ -478,16 +684,15 @@ class SessionIndexer:
 
             current_hash = self._file_hash(path)
             parsed = None
-            # Codex IDs come from session_meta, so parse once to get identity.
-            if name == "codex":
+            # A filename-derived id may be wrong; the skip below still checks path + hash.
+            session_id = self.adapters[name].session_id_from_path(path)
+            if session_id is None:
                 parsed = self._parse_session(path, name)
                 if not parsed:
                     stats["errors"] += 1
                     source_stats["errors"] += 1
                     continue
                 session_id = parsed["session_id"]
-            else:
-                session_id = path.stem
 
             existing = self.conn.execute("""
                 SELECT file_hash, file_path FROM sessions
@@ -553,6 +758,10 @@ class SessionIndexer:
             "total_agents": self.conn.execute(
                 "SELECT COUNT(DISTINCT agent_name) FROM session_agents"
                 + (" WHERE session_source=?" if source else ""), params
+            ).fetchone()[0],
+            "total_subagents": self.conn.execute(
+                "SELECT COUNT(*) FROM sessions WHERE parent_session_id IS NOT NULL"
+                + (" AND source=?" if source else ""), params
             ).fetchone()[0],
         }
         rows = self.conn.execute(

@@ -74,12 +74,34 @@ sessions tools --source codex
 sessions stats
 sessions stats --source claude
 
+# Subagent transcripts are indexed and searchable; control whether they surface
+sessions "needle" --subagents exclude
+sessions "needle" --subagents only
+sessions find --project ns --subagents only
+
+# Token usage, per session x model, from the same parse pass
+sessions usage
+sessions usage --by session -n 10
+sessions usage --by agent --week
+sessions usage --by day --days 30 --subagents exclude
+sessions usage --by tool
+sessions usage --tool Read
+sessions usage --by command
+sessions usage --by command --tool Bash --week
+
 # Index all enabled sources, or one source
 sessions index
 sessions index --backfill
 sessions index --backfill --source codex
 sessions index --session <id> --source claude
+
+# Force a reindex of specific transcripts, whose content hash has not changed
+sessions index --file <path> --file <path>
 ```
+
+`--session` and `--file` both bypass the unchanged-content check, so they are the
+way to refresh rows after an extraction rule changes. `--backfill` will not: it
+skips any transcript whose hash and path still match the indexed row.
 
 The legacy `session-index`, `session-search`, `session-analyze`, and
 `session-topic-capture` entry points remain available.
@@ -193,3 +215,61 @@ copyright and license notice are retained in [LICENSE](LICENSE).
 ## License
 
 MIT
+
+## Token usage
+
+`sessions usage` aggregates the token counts each transcript already records, so no
+extra pass over the transcripts is needed. Groupings: `model`, `source`, `project`,
+`session`, `agent`, `day`.
+
+Both sources are normalized onto one convention, where `input_tokens` counts uncached
+input only and billed input is `input_tokens + cache_read_tokens + cache_write_tokens`.
+Codex reports cached and cache-written tokens inside its `input_tokens`, so those are
+subtracted on the way in.
+
+Claude records the cache-write tiers separately, which cost different multipliers:
+`cache_write_1h_tokens` and `cache_write_5m_tokens`. `cache_write_tokens` never
+undercounts their sum, because some entries report a zero total beside a nonzero tier.
+
+### Per tool
+
+`sessions usage --by tool` splits the bill across tools, and `--tool <name>` breaks one
+tool down by session. Three separate costs, because they answer different questions:
+
+- `write` - output tokens the model spent emitting the tool call, taken from the usage
+  of the message that carried the `tool_use` block and split across the tools in it.
+- `inject` - billed input growth the result caused, measured as the delta in
+  `input + cache_write + cache_read` between consecutive calls and split across the
+  results that arrived in between, in proportion to payload size.
+- `result` - raw payload bytes the tool returned.
+
+`inject` is a first-read cost. A result then sits in context and is re-read on every
+later turn, which is where most of the cache-read total comes from; that amortized cost
+is not measured here.
+
+Context growth with no tool result in between - user messages, thinking blocks - is not
+attributed to any tool. A result whose call is not in the same transcript, from before a
+compaction or emitted by a parent session, lands under `unknown` rather than being
+smeared across the known tools.
+
+Codex records no per-call token split, so its tools report `result` bytes only.
+
+MCP tool names are canonicalized to `<server>.<tool>`. Claude writes
+`mcp__codegraph__codegraph_search` and codex writes `codegraph.codegraph_search` for the
+same tool, so without this a tool's totals split across sources and each half looks
+small. Codex also emits both a `function_call` and an `mcp_tool_call_end` for one call,
+so calls are keyed by `call_id` and counted once.
+
+### Bash by command
+
+`sessions usage --by command` breaks Bash down by what it actually ran. Leading
+navigation and output decoration are skipped, so `cd repo && grep -rn foo` is credited to
+grep, not cd. Only the first real command of a pipeline or `&&` chain is credited, so the
+breakdown sums back to the invocation count for every transcript still on disk. Tools
+whose transcript was reaped keep their `session_tools` count but can have no breakdown.
+`--tool <name>` selects a different tool to break down.
+
+Caveats. Codex reports one cumulative total per rollout rather than per call, so a
+codex session gets a single row under its last known model, and `calls` counts model
+turns rather than API calls. Sessions whose transcript was deleted keep their indexed
+text but have no usage rows.

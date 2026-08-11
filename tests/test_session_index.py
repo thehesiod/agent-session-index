@@ -17,11 +17,15 @@ from session_index.analyzer import (
     synthesize,
 )
 from session_index.indexer import SCHEMA_VERSION, SessionIndexer
-from session_index.search import SessionSearch
+from session_index.search import SessionSearch, format_result
 from session_index.sources import (
     MAX_MESSAGE_CHARS,
     ClaudeSourceAdapter,
     CodexSourceAdapter,
+    _ToolTokens,
+    _add_claude_usage,
+    bash_command,
+    canonical_tool_name,
     sanitize_text,
     strip_codex_injected_context,
 )
@@ -51,6 +55,33 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("cobalt-needle", data["fts_content"])
         self.assertNotIn("forbidden-claude-system", data["fts_content"])
 
+    def test_claude_split_response_is_billed_once(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            (root / "-proj").mkdir(parents=True)
+            usage = {"input_tokens": 100, "output_tokens": 20,
+                     "cache_read_input_tokens": 5}
+            # one API response arrives as several rows repeating id and usage
+            rows = [
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:00Z",
+                 "message": {"id": "msg_1", "role": "assistant",
+                             "model": "claude-test", "usage": usage,
+                             "content": [{"type": "text", "text": "part one"}]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01Z",
+                 "message": {"id": "msg_1", "role": "assistant",
+                             "model": "claude-test", "usage": usage,
+                             "content": [{"type": "text", "text": "part two"}]}},
+            ]
+            path = root / "-proj" / "split.jsonl"
+            path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+            data = ClaudeSourceAdapter(root).parse(path)
+
+        bucket = data["usage"]["claude-test"]
+        self.assertEqual(bucket["calls"], 1)
+        self.assertEqual(bucket["input_tokens"], 100)
+        self.assertEqual(bucket["output_tokens"], 20)
+
     def test_codex_adapter_normalizes_safe_rollout_records(self):
         path = next(CodexSourceAdapter(CODEX_ROOT).discover())
         data = CodexSourceAdapter(CODEX_ROOT).parse(path)
@@ -64,16 +95,21 @@ class AdapterTests(unittest.TestCase):
             "linear.get_issue": 1,
         })
         self.assertIn("amber-needle", data["fts_content"])
+        # tool output is indexed as a digest, after the prose boundary
+        self.assertIn("forbidden-tool-output", data["fts_content"])
+        self.assertIn("forbidden-mcp-result", data["fts_content"])
+        self.assertLess(data["prose_chars"], len(data["fts_content"]))
+        self.assertNotIn(
+            "forbidden-tool-output", data["fts_content"][:data["prose_chars"]]
+        )
         for forbidden in (
             "forbidden-codex-developer",
             "forbidden-codex-base-instructions",
             "forbidden-encrypted-reasoning",
             "forbidden-reasoning-summary",
-            "forbidden-tool-output",
             "huge-binary-tool-payload",
             "forbidden-environment-context",
             "forbidden-mcp-arguments",
-            "forbidden-mcp-result",
         ):
             self.assertNotIn(forbidden, data["fts_content"])
         metadata = json.loads(data["metadata_json"])
@@ -200,6 +236,70 @@ class AdapterTests(unittest.TestCase):
         self.assertTrue(owns_archived)
         self.assertTrue(owns_live)
         self.assertFalse(owns_foreign)
+
+    def test_codex_adapter_reads_session_id_off_the_rollout_name(self):
+        adapter = CodexSourceAdapter(CODEX_ROOT)
+        session_id = "deadbeef-1234-7abc-8def-000000000001"
+
+        self.assertEqual(
+            adapter.session_id_from_path(
+                Path(f"rollout-2026-06-11T00-42-52-{session_id}.jsonl")
+            ),
+            session_id,
+        )
+
+    def test_codex_adapter_defers_to_session_meta_when_the_name_has_no_id(self):
+        adapter = CodexSourceAdapter(CODEX_ROOT)
+
+        self.assertIsNone(
+            adapter.session_id_from_path(Path("rollout-shared-session.jsonl"))
+        )
+
+    def test_claude_adapter_reads_session_id_off_the_transcript_name(self):
+        adapter = ClaudeSourceAdapter(CLAUDE_ROOT)
+
+        self.assertEqual(
+            adapter.session_id_from_path(Path("shared-session.jsonl")),
+            "shared-session",
+        )
+
+
+class IncrementalReparseTests(unittest.TestCase):
+    def test_unchanged_codex_rollout_is_not_reparsed(self):
+        source = next(CodexSourceAdapter(CODEX_ROOT).discover())
+        session_id = "deadbeef-1234-7abc-8def-000000000001"
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "sessions"
+            (root / "2026" / "01" / "02").mkdir(parents=True)
+            rollout = (
+                root / "2026" / "01" / "02"
+                / f"rollout-2026-01-02T00-00-00-{session_id}.jsonl"
+            )
+            lines = source.read_text().splitlines()
+            meta = json.loads(lines[0])
+            meta["payload"]["id"] = session_id
+            lines[0] = json.dumps(meta)
+            rollout.write_text("\n".join(lines) + "\n")
+
+            indexer = SessionIndexer(
+                db_path=Path(tempdir) / "sessions.db",
+                source_configs={
+                    "claude": {"enabled": False},
+                    "codex": {"enabled": True, "root": str(root)},
+                },
+            )
+            indexer.connect()
+            try:
+                self.assertEqual(indexer.backfill_all(progress_interval=0)["indexed"], 1)
+                with patch.object(
+                    CodexSourceAdapter, "parse", side_effect=AssertionError("reparsed")
+                ):
+                    stats = indexer.index_incremental()
+            finally:
+                indexer.close()
+
+        self.assertEqual(stats["unchanged"], 1)
+        self.assertEqual(stats["indexed"], 0)
 
 
 class IndexIntegrationTests(unittest.TestCase):
@@ -528,6 +628,55 @@ class MigrationTests(unittest.TestCase):
         # nothing was migrated, so the first run must still backfill claude
         self.assertEqual(initialized, set())
 
+    def test_v1_upgrade_gains_columns_added_after_v2(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            db_path = Path(tempdir) / "legacy-columns.db"
+            conn = sqlite3.connect(db_path)
+            conn.executescript("""
+                CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY,
+                    project TEXT, project_name TEXT, title TEXT,
+                    title_display TEXT, tags TEXT, client TEXT,
+                    file_path TEXT NOT NULL, file_size INTEGER,
+                    exchange_count INTEGER DEFAULT 0, start_time TEXT,
+                    end_time TEXT, duration_minutes INTEGER, model TEXT,
+                    has_compaction INTEGER DEFAULT 0,
+                    indexed_at TEXT NOT NULL, last_modified TEXT,
+                    file_hash TEXT
+                );
+                CREATE VIRTUAL TABLE session_content USING fts5(
+                    session_id, content
+                );
+            """)
+            conn.execute("""
+                INSERT INTO sessions (
+                    session_id, project, project_name, file_path, indexed_at
+                ) VALUES ('legacy-id', 'legacy', 'Legacy', '/tmp/legacy.jsonl',
+                          '2026-01-01T00:00:00')
+            """)
+            conn.commit()
+            conn.close()
+
+            indexer = SessionIndexer(
+                db_path=db_path, source_configs=source_configs()
+            )
+            indexer.connect()
+            try:
+                columns = {
+                    row["name"] for row in
+                    indexer.conn.execute("PRAGMA table_info(sessions)")
+                }
+                stats = indexer.backfill_all(progress_interval=0)
+            finally:
+                indexer.close()
+
+        # a migrated v1 database rebuilds sessions and must not lose later columns
+        self.assertIn("prose_chars", columns)
+        self.assertIn("content_chars", columns)
+        self.assertIn("parent_session_id", columns)
+        self.assertEqual(stats["errors"], 0)
+        self.assertEqual(stats["indexed"], 2)
+
 
 class ConfigTests(unittest.TestCase):
     def tearDown(self):
@@ -554,6 +703,385 @@ class ConfigTests(unittest.TestCase):
                 sources["codex"]["root"], "/tmp/custom-codex"
             )
             self.assertTrue(sources["codex"]["enabled"])
+
+
+class SubagentTests(unittest.TestCase):
+    def test_subagent_transcript_is_indexed_under_its_parent(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            subagents = root / "-demo-project" / "parent-session" / "subagents"
+            subagents.mkdir(parents=True)
+            (subagents / "agent-abc123.jsonl").write_text("".join(
+                json.dumps(record) + "\n" for record in (
+                    {
+                        "type": "user",
+                        "isSidechain": True,
+                        "sessionId": "parent-session",
+                        "message": {"role": "user", "content": "find the leak"},
+                        "timestamp": "2026-01-01T00:00:00Z",
+                    },
+                    {
+                        "type": "assistant",
+                        "isSidechain": True,
+                        "sessionId": "parent-session",
+                        "attributionAgent": "Explore",
+                        "message": {"role": "assistant", "content": [
+                            {"type": "text", "text": "found viridian-needle"},
+                        ], "model": "claude-test", "usage": {
+                            "input_tokens": 11,
+                            "output_tokens": 22,
+                            "cache_read_input_tokens": 33,
+                        }},
+                        "timestamp": "2026-01-01T00:01:00Z",
+                    },
+                )
+            ))
+
+            indexer = SessionIndexer(
+                db_path=Path(tempdir) / "sessions.db",
+                source_configs={
+                    "claude": {"enabled": True, "root": str(root)},
+                    "codex": {"enabled": False, "root": str(CODEX_ROOT)},
+                },
+            )
+            indexer.connect()
+            try:
+                stats = indexer.backfill_all(progress_interval=0)
+                row = indexer.conn.execute(
+                    "SELECT parent_session_id, agent_name, project "
+                    "FROM sessions WHERE session_id='agent-abc123'"
+                ).fetchone()
+            finally:
+                indexer.close()
+
+            self.assertEqual(stats["indexed"], 1)
+            self.assertEqual(row["parent_session_id"], "parent-session")
+            self.assertEqual(row["agent_name"], "Explore")
+            self.assertEqual(row["project"], "-demo-project")
+
+            search = SessionSearch(db_path=Path(tempdir) / "sessions.db")
+            search.connect()
+            try:
+                results = search.search("viridian-needle")
+            finally:
+                search.close()
+
+            self.assertEqual(len(results), 1)
+            rendered = format_result(results[0])
+            self.assertIn("[claude/subagent]", rendered)
+            self.assertIn("agent Explore", rendered)
+            self.assertIn("claude --resume parent-session", rendered)
+
+    def test_subagent_mode_filters_search_and_find(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            project = root / "-demo-project"
+            subagents = project / "parent-session" / "subagents"
+            subagents.mkdir(parents=True)
+            for path, needle in (
+                (project / "parent-session.jsonl", "cobalt-needle"),
+                (subagents / "agent-abc123.jsonl", "viridian-needle"),
+            ):
+                record = {
+                    "type": "user",
+                    "message": {"role": "user", "content": f"{needle} shared"},
+                    "timestamp": "2026-01-01T00:00:00Z",
+                }
+                if "subagents" in path.parts:
+                    record["isSidechain"] = True
+                    record["sessionId"] = "parent-session"
+                path.write_text(json.dumps(record) + "\n")
+
+            db_path = Path(tempdir) / "sessions.db"
+            indexer = SessionIndexer(
+                db_path=db_path,
+                source_configs={
+                    "claude": {"enabled": True, "root": str(root)},
+                    "codex": {"enabled": False, "root": str(CODEX_ROOT)},
+                },
+            )
+            indexer.connect()
+            try:
+                indexer.backfill_all(progress_interval=0)
+            finally:
+                indexer.close()
+
+            search = SessionSearch(db_path=db_path)
+            search.connect()
+            try:
+                modes = {
+                    mode: {
+                        row["session_id"]
+                        for row in search.search("shared", subagents=mode)
+                    }
+                    for mode in ("include", "exclude", "only")
+                }
+                found = {
+                    mode: {
+                        row["session_id"]
+                        for row in search.find(subagents=mode)
+                    }
+                    for mode in ("include", "exclude", "only")
+                }
+                with self.assertRaises(ValueError):
+                    search.search("shared", subagents="sometimes")
+            finally:
+                search.close()
+
+            for result in (modes, found):
+                self.assertEqual(
+                    result["include"], {"parent-session", "agent-abc123"}
+                )
+                self.assertEqual(result["exclude"], {"parent-session"})
+                self.assertEqual(result["only"], {"agent-abc123"})
+
+
+class UsageTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tempdir.name) / "sessions.db"
+        indexer = SessionIndexer(
+            db_path=self.db_path, source_configs=source_configs()
+        )
+        indexer.connect()
+        indexer.backfill_all(progress_interval=0)
+        indexer.close()
+        self.search = SessionSearch(db_path=self.db_path)
+        self.search.connect()
+
+    def tearDown(self):
+        self.search.close()
+        self.tempdir.cleanup()
+
+    def test_claude_usage_splits_cache_tiers(self):
+        rows = {
+            row["grouping"]: row
+            for row in self.search.usage(by="model", source="claude")
+        }
+        row = rows["claude-test"]
+        self.assertEqual(row["calls"], 2)
+        self.assertEqual(row["input_tokens"], 10)
+        self.assertEqual(row["output_tokens"], 10)
+        # 100 with a 60/40 tier split, then 200 reported without one
+        self.assertEqual(row["cache_write_tokens"], 300)
+        self.assertEqual(row["cache_write_1h_tokens"], 60)
+        self.assertEqual(row["cache_write_5m_tokens"], 40)
+        self.assertEqual(row["cache_read_tokens"], 1800)
+
+    def test_codex_usage_reports_uncached_input_and_reasoning(self):
+        rows = {
+            row["grouping"]: row
+            for row in self.search.usage(by="model", source="codex")
+        }
+        row = rows["gpt-test"]
+        # codex counts cached tokens inside input_tokens: 1000 - 700 - 50
+        self.assertEqual(row["input_tokens"], 250)
+        self.assertEqual(row["cache_read_tokens"], 700)
+        self.assertEqual(row["cache_write_tokens"], 50)
+        self.assertEqual(row["reasoning_tokens"], 30)
+        self.assertEqual(row["output_tokens"], 40)
+
+    def test_cache_write_total_never_undercounts_its_tiers(self):
+        # Real transcripts report cache_creation_input_tokens=0 beside a tier
+        totals = {}
+        _add_claude_usage(totals, "m", {
+            "cache_creation_input_tokens": 0,
+            "cache_creation": {"ephemeral_1h_input_tokens": 916},
+        })
+        bucket = totals["m"]
+        self.assertEqual(bucket["cache_write_tokens"], 916)
+        self.assertEqual(bucket["cache_write_1h_tokens"], 916)
+
+    def test_tool_tokens_attribute_write_and_injected_input(self):
+        rows = {
+            row["grouping"]: row
+            for row in self.search.tool_tokens(source="claude")
+        }
+        row = rows["Read"]
+        self.assertEqual(row["calls"], 1)
+        # output tokens of the call that emitted the tool_use
+        self.assertEqual(row["write_tokens"], 7)
+        # billed input grew 1005 -> 1105 with only this result in between
+        self.assertEqual(row["inject_tokens"], 100)
+        self.assertEqual(row["result_bytes"], 400)
+
+    def test_tool_tokens_by_session_when_one_tool_named(self):
+        rows = self.search.tool_tokens(tool="Read")
+        self.assertEqual([row["grouping"] for row in rows],
+                         ["claude:shared-session"])
+        self.assertEqual(rows[0]["inject_tokens"], 100)
+
+    def test_codex_tool_result_bytes_are_measured(self):
+        rows = {
+            row["grouping"]: row
+            for row in self.search.tool_tokens(source="codex")
+        }
+        self.assertGreater(rows["shell_command"]["result_bytes"], 0)
+        # codex reports no per-call token split, so only payload size is known
+        self.assertEqual(rows["shell_command"]["write_tokens"], 0)
+
+    def test_unlinked_tool_result_lands_under_unknown(self):
+        tokens = _ToolTokens()
+        tokens.assistant({"content": [], "usage": {
+            "input_tokens": 10, "output_tokens": 1,
+        }})
+        tokens.result({"content": [
+            {"type": "tool_result", "tool_use_id": "absent", "content": "y" * 50},
+        ]})
+        tokens.assistant({"content": [], "usage": {
+            "input_tokens": 60, "output_tokens": 1,
+        }})
+        self.assertEqual(tokens.totals["unknown"]["result_bytes"], 50)
+        self.assertEqual(tokens.totals["unknown"]["inject_tokens"], 50)
+
+    def test_bash_command_names_the_real_command(self):
+        cases = {
+            "cd /repo; sessions usage --by tool": "sessions",
+            "cd ~/repo && git -C ~/repo log --oneline": "git log",
+            "grep -rn foo . | head -20": "grep",
+            'echo "=== a ==="; sqlite3 db "select 1"': "sqlite3",
+            "AWS_PROFILE=eng aws s3 ls": "aws s3",
+            "sudo /usr/local/bin/docker compose down": "docker compose",
+            "cd /tmp": "cd",
+            "": "",
+        }
+        for command, expected in cases.items():
+            self.assertEqual(bash_command(command), expected, command)
+
+    def test_canonical_tool_name_collapses_mcp_spellings(self):
+        self.assertEqual(
+            canonical_tool_name("mcp__codegraph__codegraph_search"),
+            "codegraph.codegraph_search",
+        )
+        self.assertEqual(
+            canonical_tool_name("codegraph.codegraph_search"),
+            "codegraph.codegraph_search",
+        )
+        self.assertEqual(canonical_tool_name("Bash"), "Bash")
+
+    def test_usage_groupings_and_rejects_unknown(self):
+        for by in ("model", "source", "project", "session", "day"):
+            self.assertTrue(self.search.usage(by=by))
+        with self.assertRaises(ValueError):
+            self.search.usage(by="wingspan")
+
+    def test_orphaned_child_rows_are_swept(self):
+        indexer = SessionIndexer(
+            db_path=self.db_path, source_configs=source_configs()
+        )
+        indexer.connect()
+        try:
+            indexer.conn.execute("PRAGMA foreign_keys=OFF")
+            indexer.conn.execute(
+                "INSERT INTO session_tools (session_source, session_id, "
+                "tool_name, use_count) VALUES ('claude', 'ghost', 'Bash', 99)"
+            )
+            indexer.conn.commit()
+            indexer._sweep_orphans()
+            remaining, = indexer.conn.execute(
+                "SELECT COUNT(*) FROM session_tools WHERE session_id='ghost'"
+            ).fetchone()
+            violations = indexer.conn.execute(
+                "PRAGMA foreign_key_check"
+            ).fetchall()
+        finally:
+            indexer.close()
+        self.assertEqual(remaining, 0)
+        self.assertEqual(violations, [])
+
+    def test_usage_rows_disappear_with_their_session(self):
+        self.search.conn.execute("PRAGMA foreign_keys=ON")
+        self.search.conn.execute(
+            "DELETE FROM sessions WHERE source='claude'"
+        )
+        self.assertEqual(self.search.usage(by="model", source="claude"), [])
+
+
+class LongSessionTests(unittest.TestCase):
+    def _write_long_transcript(self, root: Path) -> Path:
+        (root / "-long-project").mkdir(parents=True)
+        transcript = root / "-long-project" / "long-session.jsonl"
+        filler = "reviewed the paginator and the tombstone sweep in detail. "
+        with transcript.open("w") as handle:
+            for index in range(4000):
+                handle.write(json.dumps({
+                    "type": "assistant",
+                    "message": {"role": "assistant", "content": [
+                        {"type": "text", "text": f"turn {index}: {filler * 2}"},
+                    ]},
+                    "timestamp": "2026-01-01T00:00:00Z",
+                }) + "\n")
+            handle.write(json.dumps({
+                "type": "user",
+                "message": {"role": "user", "content": "wrap up PR #4033"},
+                "timestamp": "2026-01-01T01:00:00Z",
+            }) + "\n")
+        return transcript
+
+    def _indexer(self, tempdir: str, root: Path) -> SessionIndexer:
+        indexer = SessionIndexer(
+            db_path=Path(tempdir) / "sessions.db",
+            source_configs={
+                "claude": {"enabled": True, "root": str(root)},
+                "codex": {"enabled": False, "root": str(CODEX_ROOT)},
+            },
+        )
+        indexer.connect()
+        return indexer
+
+    def test_prose_past_the_old_cap_stays_searchable(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            self._write_long_transcript(root)
+            indexer = self._indexer(tempdir, root)
+            try:
+                indexer.backfill_all(progress_interval=0)
+                (content,) = indexer.conn.execute(
+                    "SELECT content FROM session_content "
+                    "WHERE session_id='long-session'"
+                ).fetchone()
+            finally:
+                indexer.close()
+
+            self.assertGreater(len(content), 100_000)
+            self.assertIn("4033", content)
+
+    def test_index_file_refreshes_a_row_whose_hash_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            transcript = self._write_long_transcript(root)
+            db_path = Path(tempdir) / "sessions.db"
+            indexer = self._indexer(tempdir, root)
+            try:
+                indexer.backfill_all(progress_interval=0)
+                indexer.conn.execute(
+                    "UPDATE session_content SET content=substr(content,1,100000) "
+                    "WHERE session_id='long-session'"
+                )
+                indexer.conn.commit()
+                truncated = indexer.backfill_all(progress_interval=0)
+            finally:
+                indexer.close()
+
+            self.assertEqual(truncated["indexed"], 0)
+
+            argv = [
+                "sessions", "--db-path", str(db_path),
+                "index", "--claude-root", str(root), "--file", str(transcript),
+            ]
+            with patch("sys.argv", argv), redirect_stdout(io.StringIO()):
+                cli.main()
+
+            connection = sqlite3.connect(db_path)
+            try:
+                (content,) = connection.execute(
+                    "SELECT content FROM session_content "
+                    "WHERE session_id='long-session'"
+                ).fetchone()
+            finally:
+                connection.close()
+
+            self.assertIn("4033", content)
 
 
 if __name__ == "__main__":
