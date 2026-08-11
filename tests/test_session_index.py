@@ -16,7 +16,11 @@ from session_index.analyzer import (
     indexed_excerpts,
     synthesize,
 )
-from session_index.indexer import SCHEMA_VERSION, SessionIndexer
+from session_index.indexer import (
+    EXTRACTION_VERSION,
+    SCHEMA_VERSION,
+    SessionIndexer,
+)
 from session_index.search import SessionSearch, format_result
 from session_index.sources import (
     MAX_MESSAGE_CHARS,
@@ -81,6 +85,58 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(bucket["calls"], 1)
         self.assertEqual(bucket["input_tokens"], 100)
         self.assertEqual(bucket["output_tokens"], 20)
+
+    def test_claude_adapter_excludes_harness_injected_context(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            (root / "-proj").mkdir(parents=True)
+            rows = [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {
+                    "role": "user", "content":
+                    "<task-notification>forbidden-task-note</task-notification>"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:01Z", "message": {
+                    "role": "user", "content":
+                    "<local-command-caveat>Caveat: forbidden-caveat"
+                    "</local-command-caveat>"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:02Z", "message": {
+                    "role": "user", "content":
+                    "<system-reminder>forbidden-reminder</system-reminder>"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:03Z", "message": {
+                    "role": "user", "content":
+                    "<local-command-stdout>forbidden-stdout</local-command-stdout>"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:04Z", "message": {
+                    "role": "user", "content":
+                    "<task-notification>forbidden-unclosed and never closed"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:05Z", "message": {
+                    "role": "user", "content":
+                    "<command-name>/ns-review</command-name> keep-the-args"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:06Z", "message": {
+                    "role": "user", "content": "Find the teal scheduler bug"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:07Z", "message": {
+                    "role": "assistant", "model": "claude-test",
+                    "content": [{"type": "text", "text": "answer is jade-needle"}]}},
+            ]
+            path = root / "-proj" / "injected.jsonl"
+            path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+            data = ClaudeSourceAdapter(root).parse(path)
+            exchanges = ClaudeSourceAdapter(root).extract_exchanges(path)
+
+        for forbidden in (
+            "forbidden-task-note", "forbidden-caveat", "forbidden-reminder",
+            "forbidden-stdout", "forbidden-unclosed",
+        ):
+            self.assertNotIn(forbidden, data["fts_content"])
+        # a slash command records what the user asked for, so it stays searchable
+        self.assertIn("keep-the-args", data["fts_content"])
+        # ...but never titles the session
+        self.assertEqual(data["title"], "Find the teal scheduler bug")
+        self.assertEqual(data["exchange_count"], 3)
+        # extract_exchanges must filter the same way parse() does
+        user_side = "\n".join(item["user"] for item in exchanges)
+        self.assertNotIn("forbidden-task-note", user_side)
+        self.assertNotIn("forbidden-reminder", user_side)
+        self.assertIn("Find the teal scheduler bug", user_side)
 
     def test_codex_adapter_normalizes_safe_rollout_records(self):
         path = next(CodexSourceAdapter(CODEX_ROOT).discover())
@@ -676,6 +732,35 @@ class MigrationTests(unittest.TestCase):
         self.assertIn("parent_session_id", columns)
         self.assertEqual(stats["errors"], 0)
         self.assertEqual(stats["indexed"], 2)
+
+    def test_stale_extraction_version_forces_a_reparse(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            db_path = Path(tempdir) / "extraction.db"
+            indexer = SessionIndexer(
+                db_path=db_path, source_configs=source_configs()
+            )
+            indexer.connect()
+            try:
+                first = indexer.backfill_all(progress_interval=0)
+                stored = {
+                    row[0] for row in indexer.conn.execute(
+                        "SELECT extraction_version FROM sessions"
+                    )
+                }
+                # nothing changed on disk, so a second pass must skip everything
+                second = indexer.backfill_all(progress_interval=0)
+                # ...but a row extracted by older rules must be reparsed
+                indexer.conn.execute("UPDATE sessions SET extraction_version = 0")
+                indexer.conn.commit()
+                third = indexer.backfill_all(progress_interval=0)
+            finally:
+                indexer.close()
+
+        self.assertEqual(stored, {EXTRACTION_VERSION})
+        self.assertEqual(first["indexed"], 2)
+        self.assertEqual(second["indexed"], 0)
+        self.assertEqual(second["skipped"], 2)
+        self.assertEqual(third["indexed"], 2)
 
 
 class ConfigTests(unittest.TestCase):

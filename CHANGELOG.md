@@ -1,5 +1,85 @@
 # Changelog
 
+## Unreleased
+
+Nothing below has been released; `pyproject` still reads 0.5.0. Bug fixes that
+landed after the 0.5.0 notes were written are collected here rather than edited
+back into the version sections that predate them.
+
+### Indexed content
+
+- Exclude the context Codex injects into user-role records — delegation payloads,
+  skill bodies, plugin catalogs, and `AGENTS.md` repository configuration. These
+  passed the sanitizer and were both searchable and picked as session titles, so
+  sessions were named `<recommended_plugins>` rather than by their prompt.
+- Index a Codex rollout whose turns exist only as `user_message`/`agent_message`
+  events, as review and exec subagent rollouts do. They previously produced no
+  title, no exchanges, and no searchable text at all.
+- Exclude the context the Claude harness injects into user-role records:
+  `task-notification`, `system-reminder`, `local-command-caveat`,
+  `local-command-stdout`, `bash-stdout`/`bash-stderr`, and the 9KB
+  `fork-boilerplate` worker preamble. These reached FTS and named sessions,
+  the same defect already fixed for Codex rollouts. Across a local corpus of
+  3030 transcripts this removes ~6.9MB of injected text and every wrapper
+  title (68 -> 0), 51 of which become the session's real first prompt.
+- Keep what the user actually asked for. Slash-command invocations
+  (`command-name`/`command-message`/`command-args`) and `!` bash input stay
+  searchable, and are only barred from becoming a session title.
+
+### Reindexing
+
+- Reparse a session when the extraction rules change. `sessions` stamps each
+  row with an `extraction_version` and the incremental skip now requires it to
+  match, so a fix to what the adapters extract reaches existing rows instead of
+  waiting for the transcript itself to change. Without it every fix above
+  applied only to sessions recorded after the upgrade, leaving the older
+  injected text searchable — and its vectors with it.
+
+### Correctness
+
+- Keep a Codex rollout's own identity. A subagent rollout replays its parent's
+  `session_meta`, and every such record overwrote the session id, cwd, start time,
+  and metadata — so children adopted the parent's id and collided onto one row,
+  silently dropping sessions. Only the first metadata record is now read.
+- Derive Codex compaction from `compacted` records and `context_compacted` events.
+  `turn_context.summary` is a setting whose value is `auto` or `none`, so reading it
+  as a summary marked uncompacted sessions as compacted and stored the setting as
+  the session topic.
+- Count an MCP invocation once. A single call emits both a `function_call` and an
+  `mcp_tool_call_end`, and each incremented the tool tally separately.
+- Bill a split Claude response once. One API response arrives as several
+  `assistant` rows repeating the same `message.id` and the same `usage` object,
+  so `sessions usage` multiplied both calls and tokens.
+- Resolve an archived Codex rollout back to its source. Adapters expose `roots()`
+  and `owns()`, so `sessions index --file` no longer fails with "Cannot determine
+  session source" on a rollout that `discover()` finds.
+
+### Upgrades and the vector layer
+
+- Apply columns added after schema v2 on the v1 migration path too. A migrated
+  v1 database came out without `prose_chars`/`content_chars`, so its first
+  backfill failed on every session.
+- Leave a migrated v1 database uninitialized so its first run reparses it. The
+  migration copies FTS built by the old rules, which indexed system-like prompts
+  and omitted assistant text, and marking Claude initialized froze that in place.
+- Migrate the schema before `sessions embed` and before `SessionSearch.connect()`
+  reads columns a pre-v3 database lacks.
+- Load one session at a time when embedding. `run_embed` selected every session's
+  content in a single `fetchall`, which the 8MB per-session ceiling multiplies:
+  on a 4004-session index the list alone peaked at 1037MB, now 41MB.
+- Drop a session's vectors when embedding is skipped or fails, so hybrid search
+  stops matching prose the transcript no longer contains.
+- Pass `force_download=False` when loading the embedding model. `from_pretrained`
+  defaults to `True`, so the cached path still called `snapshot_download` and the
+  offline environment variable could not prevent it.
+
+### Output
+
+- Restore the project and tool breakdowns in `sessions stats`, dropped in the
+  source-aware rewrite while `get_stats()` still computed them.
+- Fall back to literal matching when a `sessions context` query is not a valid
+  regex, rather than silently returning unfiltered text.
+
 ## 0.5.0
 
 - Index a digest of tool activity, not just prose. Every tool call contributes its
@@ -126,30 +206,6 @@
   tools, topics, stats, and indexing commands.
 - Exclude developer/system instructions, reasoning records, tool outputs, and
   large encoded payloads from FTS.
-- Exclude the context Codex injects into user-role records — delegation payloads,
-  skill bodies, plugin catalogs, and `AGENTS.md` repository configuration. These
-  passed the sanitizer and were both searchable and picked as session titles, so
-  sessions were named `<recommended_plugins>` rather than by their prompt.
-- Keep a Codex rollout's own identity. A subagent rollout replays its parent's
-  `session_meta`, and every such record overwrote the session id, cwd, start time,
-  and metadata — so children adopted the parent's id and collided onto one row,
-  silently dropping sessions. Only the first metadata record is now read.
-- Count an MCP invocation once. A single call emits both a `function_call` and an
-  `mcp_tool_call_end`, and each incremented the tool tally separately.
-- Index a Codex rollout whose turns exist only as `user_message`/`agent_message`
-  events, as review and exec subagent rollouts do. They previously produced no
-  title, no exchanges, and no searchable text at all.
-- Leave a migrated v1 database uninitialized so its first run reparses it. The
-  migration copies FTS built by the old rules, which indexed system-like prompts
-  and omitted assistant text, and marking Claude initialized froze that in place.
-- Restore the project and tool breakdowns in `sessions stats`, dropped in the
-  source-aware rewrite while `get_stats()` still computed them.
-- Fall back to literal matching when a `sessions context` query is not a valid
-  regex, rather than silently returning unfiltered text.
-- Derive Codex compaction from `compacted` records and `context_compacted` events.
-  `turn_context.summary` is a setting whose value is `auto` or `none`, so reading it
-  as a summary marked uncompacted sessions as compacted and stored the setting as
-  the session topic.
 - Keep all indexing and synthesis workflows local; transcript uploads are
   disabled.
 
