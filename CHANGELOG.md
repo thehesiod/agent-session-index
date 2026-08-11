@@ -26,6 +26,15 @@ back into the version sections that predate them.
   (`command-name`/`command-message`/`command-args`) and `!` bash input stay
   searchable, and are only barred from becoming a session title.
 
+### Reindexing
+
+- Reparse a session when the extraction rules change. `sessions` stamps each
+  row with an `extraction_version` and the incremental skip now requires it to
+  match, so a fix to what the adapters extract reaches existing rows instead of
+  waiting for the transcript itself to change. Without it every fix above
+  applied only to sessions recorded after the upgrade, leaving the older
+  injected text searchable — and its vectors with it.
+
 ### Correctness
 
 - Keep a Codex rollout's own identity. A subagent rollout replays its parent's

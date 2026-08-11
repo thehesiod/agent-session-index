@@ -21,6 +21,8 @@ except ImportError:
     from sources import build_adapters
 
 SCHEMA_VERSION = 3
+# bump when the adapters change what they extract; the hash-based skip cannot see that
+EXTRACTION_VERSION = 1
 VALID_SOURCES = ("claude", "codex")
 
 
@@ -117,6 +119,7 @@ class SessionIndexer:
             ("agent_name", "TEXT"),
             ("prose_chars", "INTEGER DEFAULT 0"),
             ("content_chars", "INTEGER DEFAULT 0"),
+            ("extraction_version", "INTEGER DEFAULT 0"),
         ):
             if name not in columns:
                 self.conn.execute(
@@ -512,6 +515,7 @@ class SessionIndexer:
                 data.get("parent_session_id"), data.get("agent_name"),
                 data.get("prose_chars") or 0,
                 len(data.get("fts_content") or ""),
+                EXTRACTION_VERSION,
             )
             self.conn.execute("""
                 INSERT INTO sessions (
@@ -520,10 +524,10 @@ class SessionIndexer:
                     exchange_count, start_time, end_time, duration_minutes,
                     model, has_compaction, metadata_json, indexed_at,
                     last_modified, file_hash, parent_session_id, agent_name,
-                    prose_chars, content_chars
+                    prose_chars, content_chars, extraction_version
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    ?, ?, ?, ?, ?
+                    ?, ?, ?, ?, ?, ?
                 )
                 ON CONFLICT(source, session_id) DO UPDATE SET
                     parent_session_id=excluded.parent_session_id,
@@ -548,7 +552,8 @@ class SessionIndexer:
                     last_modified=excluded.last_modified,
                     file_hash=excluded.file_hash,
                     prose_chars=excluded.prose_chars,
-                    content_chars=excluded.content_chars
+                    content_chars=excluded.content_chars,
+                    extraction_version=excluded.extraction_version
             """, values)
 
             identity = (data["source"], data["session_id"])
@@ -695,12 +700,13 @@ class SessionIndexer:
                 session_id = parsed["session_id"]
 
             existing = self.conn.execute("""
-                SELECT file_hash, file_path FROM sessions
+                SELECT file_hash, file_path, extraction_version FROM sessions
                 WHERE source=? AND session_id=?
             """, (name, session_id)).fetchone()
-            # A relocated transcript keeps its hash, so file_path must match too
+            # relocation keeps the hash, and older extraction rules reparse though both match
             if (existing and existing["file_hash"] == current_hash
-                    and existing["file_path"] == str(path)):
+                    and existing["file_path"] == str(path)
+                    and (existing["extraction_version"] or 0) == EXTRACTION_VERSION):
                 stats[unchanged_key] += 1
                 source_stats["unchanged"] += 1
                 continue

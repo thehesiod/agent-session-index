@@ -16,7 +16,11 @@ from session_index.analyzer import (
     indexed_excerpts,
     synthesize,
 )
-from session_index.indexer import SCHEMA_VERSION, SessionIndexer
+from session_index.indexer import (
+    EXTRACTION_VERSION,
+    SCHEMA_VERSION,
+    SessionIndexer,
+)
 from session_index.search import SessionSearch, format_result
 from session_index.sources import (
     MAX_MESSAGE_CHARS,
@@ -728,6 +732,35 @@ class MigrationTests(unittest.TestCase):
         self.assertIn("parent_session_id", columns)
         self.assertEqual(stats["errors"], 0)
         self.assertEqual(stats["indexed"], 2)
+
+    def test_stale_extraction_version_forces_a_reparse(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            db_path = Path(tempdir) / "extraction.db"
+            indexer = SessionIndexer(
+                db_path=db_path, source_configs=source_configs()
+            )
+            indexer.connect()
+            try:
+                first = indexer.backfill_all(progress_interval=0)
+                stored = {
+                    row[0] for row in indexer.conn.execute(
+                        "SELECT extraction_version FROM sessions"
+                    )
+                }
+                # nothing changed on disk, so a second pass must skip everything
+                second = indexer.backfill_all(progress_interval=0)
+                # ...but a row extracted by older rules must be reparsed
+                indexer.conn.execute("UPDATE sessions SET extraction_version = 0")
+                indexer.conn.commit()
+                third = indexer.backfill_all(progress_interval=0)
+            finally:
+                indexer.close()
+
+        self.assertEqual(stored, {EXTRACTION_VERSION})
+        self.assertEqual(first["indexed"], 2)
+        self.assertEqual(second["indexed"], 0)
+        self.assertEqual(second["skipped"], 2)
+        self.assertEqual(third["indexed"], 2)
 
 
 class ConfigTests(unittest.TestCase):
