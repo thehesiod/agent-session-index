@@ -277,6 +277,13 @@ class SessionSourceAdapter:
         self.project_names = project_names or {}
         self.clients = clients or []
 
+    def roots(self) -> Iterable[Path]:
+        """Every directory this source discovers transcripts under."""
+        yield self.root
+
+    def owns(self, path: Path) -> bool:
+        return any(path.is_relative_to(root) for root in self.roots())
+
     def discover(self) -> Iterable[Path]:
         raise NotImplementedError
 
@@ -438,14 +445,14 @@ class CodexSourceAdapter(SessionSourceAdapter):
     # codex archives a session by MOVING its rollout into a sibling archived_sessions/
     ARCHIVED_DIR = "archived_sessions"
 
-    def _roots(self) -> Iterable[Path]:
+    def roots(self) -> Iterable[Path]:
         yield self.root
         archived = self.root.parent / self.ARCHIVED_DIR
         if not archived.is_relative_to(self.root):
             yield archived
 
     def discover(self) -> Iterable[Path]:
-        for root in self._roots():
+        for root in self.roots():
             if root.exists():
                 yield from root.rglob("*.jsonl")
 

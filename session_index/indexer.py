@@ -326,11 +326,8 @@ class SessionIndexer:
                 matches = [(source, path)]
             else:
                 for name, adapter in self.adapters.items():
-                    try:
-                        path.relative_to(adapter.root)
+                    if adapter.owns(path):
                         matches.append((name, path))
-                    except ValueError:
-                        continue
                 if not matches:
                     print("Cannot determine session source; pass --source",
                           file=sys.stderr)

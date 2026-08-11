@@ -142,8 +142,16 @@ class AdapterTests(unittest.TestCase):
             (archived / "archived.jsonl").write_text("")
 
             found = {path.name for path in CodexSourceAdapter(root).discover()}
+            adapter = CodexSourceAdapter(root)
+            owns_archived = adapter.owns(archived / "archived.jsonl")
+            owns_live = adapter.owns(root / "live.jsonl")
+            owns_foreign = adapter.owns(Path(tempdir) / "elsewhere.jsonl")
 
         self.assertEqual(found, {"live.jsonl", "archived.jsonl"})
+        # a rollout the adapter discovers must also resolve back to this source
+        self.assertTrue(owns_archived)
+        self.assertTrue(owns_live)
+        self.assertFalse(owns_foreign)
 
 
 class IndexIntegrationTests(unittest.TestCase):
