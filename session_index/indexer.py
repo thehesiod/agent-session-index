@@ -22,7 +22,7 @@ except ImportError:
 
 SCHEMA_VERSION = 3
 # bump when the adapters change what they extract; the hash-based skip cannot see that
-EXTRACTION_VERSION = 1
+EXTRACTION_VERSION = 2
 VALID_SOURCES = ("claude", "codex")
 
 
