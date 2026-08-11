@@ -82,6 +82,58 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(bucket["input_tokens"], 100)
         self.assertEqual(bucket["output_tokens"], 20)
 
+    def test_claude_adapter_excludes_harness_injected_context(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            (root / "-proj").mkdir(parents=True)
+            rows = [
+                {"type": "user", "timestamp": "2026-01-01T00:00:00Z", "message": {
+                    "role": "user", "content":
+                    "<task-notification>forbidden-task-note</task-notification>"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:01Z", "message": {
+                    "role": "user", "content":
+                    "<local-command-caveat>Caveat: forbidden-caveat"
+                    "</local-command-caveat>"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:02Z", "message": {
+                    "role": "user", "content":
+                    "<system-reminder>forbidden-reminder</system-reminder>"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:03Z", "message": {
+                    "role": "user", "content":
+                    "<local-command-stdout>forbidden-stdout</local-command-stdout>"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:04Z", "message": {
+                    "role": "user", "content":
+                    "<task-notification>forbidden-unclosed and never closed"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:05Z", "message": {
+                    "role": "user", "content":
+                    "<command-name>/ns-review</command-name> keep-the-args"}},
+                {"type": "user", "timestamp": "2026-01-01T00:00:06Z", "message": {
+                    "role": "user", "content": "Find the teal scheduler bug"}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:07Z", "message": {
+                    "role": "assistant", "model": "claude-test",
+                    "content": [{"type": "text", "text": "answer is jade-needle"}]}},
+            ]
+            path = root / "-proj" / "injected.jsonl"
+            path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+            data = ClaudeSourceAdapter(root).parse(path)
+            exchanges = ClaudeSourceAdapter(root).extract_exchanges(path)
+
+        for forbidden in (
+            "forbidden-task-note", "forbidden-caveat", "forbidden-reminder",
+            "forbidden-stdout", "forbidden-unclosed",
+        ):
+            self.assertNotIn(forbidden, data["fts_content"])
+        # a slash command records what the user asked for, so it stays searchable
+        self.assertIn("keep-the-args", data["fts_content"])
+        # ...but never titles the session
+        self.assertEqual(data["title"], "Find the teal scheduler bug")
+        self.assertEqual(data["exchange_count"], 3)
+        # extract_exchanges must filter the same way parse() does
+        user_side = "\n".join(item["user"] for item in exchanges)
+        self.assertNotIn("forbidden-task-note", user_side)
+        self.assertNotIn("forbidden-reminder", user_side)
+        self.assertIn("Find the teal scheduler bug", user_side)
+
     def test_codex_adapter_normalizes_safe_rollout_records(self):
         path = next(CodexSourceAdapter(CODEX_ROOT).discover())
         data = CodexSourceAdapter(CODEX_ROOT).parse(path)

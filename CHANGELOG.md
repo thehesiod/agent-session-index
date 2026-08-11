@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Exclude the context the Claude harness injects into user-role records:
+  `task-notification`, `system-reminder`, `local-command-caveat`,
+  `local-command-stdout`, `bash-stdout`/`bash-stderr`, and the 9KB
+  `fork-boilerplate` worker preamble. These reached FTS and named sessions,
+  the same defect already fixed for Codex rollouts. Across a local corpus of
+  3030 transcripts this removes ~6.9MB of injected text and every wrapper
+  title (68 -> 0), 51 of which become the session's real first prompt.
+- Keep what the user actually asked for. Slash-command invocations
+  (`command-name`/`command-message`/`command-args`) and `!` bash input stay
+  searchable, and are only barred from becoming a session title.
+
 ## 0.5.0
 
 - Index a digest of tool activity, not just prose. Every tool call contributes its
