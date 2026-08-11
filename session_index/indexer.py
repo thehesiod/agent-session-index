@@ -257,14 +257,7 @@ class SessionIndexer:
                     SELECT 'claude', session_id, content
                     FROM session_content_migration
                 """)
-            # an empty v1 db migrates nothing, so leave claude eligible for backfill
-            if self.conn.execute(
-                "SELECT 1 FROM sessions WHERE source='claude' LIMIT 1"
-            ).fetchone():
-                self.conn.execute("""
-                    INSERT OR REPLACE INTO index_state (source, initialized_at)
-                    VALUES ('claude', ?)
-                """, (datetime.now().isoformat(),))
+            # v1 FTS was built by the old rules; leave claude uninitialized so it reparses
 
             for table in (
                 "session_topics_v1", "session_tools_v1",

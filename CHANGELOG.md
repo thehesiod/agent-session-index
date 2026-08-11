@@ -28,8 +28,14 @@
   silently dropping sessions. Only the first metadata record is now read.
 - Count an MCP invocation once. A single call emits both a `function_call` and an
   `mcp_tool_call_end`, and each incremented the tool tally separately.
-- Leave an empty v1 database eligible for its first backfill instead of marking
-  Claude initialized when the migration moved no rows.
+- Index a Codex rollout whose turns exist only as `user_message`/`agent_message`
+  events, as review and exec subagent rollouts do. They previously produced no
+  title, no exchanges, and no searchable text at all.
+- Leave a migrated v1 database uninitialized so its first run reparses it. The
+  migration copies FTS built by the old rules, which indexed system-like prompts
+  and omitted assistant text, and marking Claude initialized froze that in place.
+- Restore the project and tool breakdowns in `sessions stats`, dropped in the
+  source-aware rewrite while `get_stats()` still computed them.
 - Fall back to literal matching when a `sessions context` query is not a valid
   regex, rather than silently returning unfiltered text.
 - Derive Codex compaction from `compacted` records and `context_compacted` events.

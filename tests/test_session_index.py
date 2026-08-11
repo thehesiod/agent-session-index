@@ -147,6 +147,39 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(data["has_compaction"], 0)
         self.assertEqual(data["topics"], [])
 
+    def test_codex_event_only_rollout_is_still_indexed(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "sessions"
+            root.mkdir()
+            (root / "event-only.jsonl").write_text("\n".join(json.dumps(rec) for rec in [
+                {"timestamp": "2026-01-02T11:00:00Z", "type": "session_meta",
+                 "payload": {"id": "event-only", "cwd": "/Users/test/demo"}},
+                {"timestamp": "2026-01-02T11:00:01Z", "type": "event_msg",
+                 "payload": {"type": "user_message",
+                             "message": "Review the teal scheduler regression"}},
+                {"timestamp": "2026-01-02T11:00:02Z", "type": "event_msg",
+                 "payload": {"type": "agent_message",
+                             "message": "The event-only answer is jade-needle."}},
+            ]) + "\n")
+            path = root / "event-only.jsonl"
+
+            data = CodexSourceAdapter(root).parse(path)
+            exchanges = CodexSourceAdapter(root).extract_exchanges(path)
+
+        # review/exec subagent rollouts store their turns only as events
+        self.assertEqual(data["title"], "Review the teal scheduler regression")
+        self.assertEqual(data["exchange_count"], 2)
+        self.assertIn("jade-needle", data["fts_content"])
+        self.assertEqual(len(exchanges), 1)
+        self.assertIn("jade-needle", exchanges[0]["assistant"])
+
+    def test_codex_event_messages_do_not_duplicate_response_items(self):
+        path = next(CodexSourceAdapter(CODEX_ROOT).discover())
+        data = CodexSourceAdapter(CODEX_ROOT).parse(path)
+
+        # the shared fixture carries response_item messages, so events must not re-add them
+        self.assertEqual(data["fts_content"].count("amber-needle"), 1)
+
     def test_codex_adapter_discovers_archived_rollouts(self):
         with tempfile.TemporaryDirectory() as tempdir:
             root = Path(tempdir) / "sessions"

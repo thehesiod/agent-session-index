@@ -343,6 +343,17 @@ def main():
                     f"  Range:     {date_range['earliest']} → "
                     f"{date_range['latest']}"
                 )
+            if stats.get("by_project"):
+                print("\n  📁 By project")
+                print(f"  {'─' * 36}")
+                for name, count in list(stats["by_project"].items())[:10]:
+                    print(f"  {name:25s}  {count:>5d}")
+            if stats.get("top_tools"):
+                print("\n  🔧 Top tools")
+                print(f"  {'─' * 36}")
+                for name, count in list(stats["top_tools"].items())[:10]:
+                    print(f"  {name:25s}  {count:>5d}")
+            print()
     finally:
         searcher.close()
 

@@ -470,6 +470,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
         metadata: dict = {"format": "codex-rollout"}
         # one MCP call emits both a function_call and an mcp_tool_call_end; key by call_id
         codex_calls: dict[str, str] = {}
+        event_messages: list[tuple[str, str]] = []
 
         for entry in _read_jsonl(path):
             timestamp = entry.get("timestamp")
@@ -541,6 +542,15 @@ class CodexSourceAdapter(SessionSourceAdapter):
                 saw_compaction = True
             elif (
                 entry_type == "event_msg"
+                and payload.get("type") in ("user_message", "agent_message")
+            ):
+                text = sanitize_text(payload.get("message", ""))
+                if text:
+                    role = ("user" if payload["type"] == "user_message"
+                            else "assistant")
+                    event_messages.append((role, text))
+            elif (
+                entry_type == "event_msg"
                 and payload.get("type") == "mcp_tool_call_end"
             ):
                 invocation = payload.get("invocation") or {}
@@ -550,6 +560,20 @@ class CodexSourceAdapter(SessionSourceAdapter):
                 if name:
                     call_id = payload.get("call_id") or f"mcp-{len(codex_calls)}"
                     codex_calls[call_id] = name
+
+        # review/exec subagent rollouts carry their turns only as events
+        if not fts_messages:
+            for role, text in event_messages:
+                if role == "user":
+                    text = strip_codex_injected_context(text)
+                    if _looks_like_system_prompt(text):
+                        continue
+                if not text:
+                    continue
+                exchange_count += 1
+                if role == "user":
+                    user_prompts.append(text)
+                fts_messages.append(text)
 
         for name in codex_calls.values():
             tools[name] = tools.get(name, 0) + 1
@@ -592,22 +616,37 @@ class CodexSourceAdapter(SessionSourceAdapter):
     def extract_exchanges(self, path: Path, query: str | None = None,
                           limit: int = 10, max_chars: int = 1000) -> list[dict]:
         entries = []
+        event_entries = []
+        saw_response_message = False
         for entry in _read_jsonl(path):
             payload = entry.get("payload") or {}
-            if (
-                entry.get("type") == "event_msg"
-                and payload.get("type") == "mcp_tool_call_end"
-            ):
-                invocation = payload.get("invocation") or {}
-                server = sanitize_text(invocation.get("server", ""), 100)
-                tool = sanitize_text(invocation.get("tool", ""), 100)
-                name = ".".join(part for part in (server, tool) if part)
-                if name:
-                    entries.append({
-                        "type": "assistant",
-                        "text": f"[{name}]",
-                        "timestamp": entry.get("timestamp", ""),
-                    })
+            if entry.get("type") == "event_msg":
+                event_type = payload.get("type")
+                if event_type == "mcp_tool_call_end":
+                    invocation = payload.get("invocation") or {}
+                    server = sanitize_text(invocation.get("server", ""), 100)
+                    tool = sanitize_text(invocation.get("tool", ""), 100)
+                    name = ".".join(part for part in (server, tool) if part)
+                    if name:
+                        entries.append({
+                            "type": "assistant",
+                            "text": f"[{name}]",
+                            "timestamp": entry.get("timestamp", ""),
+                        })
+                elif event_type in ("user_message", "agent_message"):
+                    role = ("user" if event_type == "user_message"
+                            else "assistant")
+                    text = sanitize_text(payload.get("message", ""))
+                    if role == "user":
+                        text = strip_codex_injected_context(text)
+                        if _looks_like_system_prompt(text):
+                            continue
+                    if text:
+                        event_entries.append({
+                            "type": role,
+                            "text": text,
+                            "timestamp": entry.get("timestamp", ""),
+                        })
                 continue
             if entry.get("type") != "response_item":
                 continue
@@ -620,6 +659,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
                     if _looks_like_system_prompt(text):
                         continue
                 if text:
+                    saw_response_message = True
                     entries.append({
                         "type": role,
                         "text": text,
@@ -636,6 +676,10 @@ class CodexSourceAdapter(SessionSourceAdapter):
                         "text": f"[{name}]",
                         "timestamp": entry.get("timestamp", ""),
                     })
+        if not saw_response_message and event_entries:
+            entries = sorted(
+                entries + event_entries, key=lambda item: item["timestamp"]
+            )
         return _pair_entries(entries, query, limit, max_chars)
 
 
