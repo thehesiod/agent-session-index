@@ -8,7 +8,11 @@ by the SQLite index.  Deliberately excluded from indexed text:
 * tool results and tool arguments
 * binary/data-URL payloads
 * context the agent injects into user-role records (delegation payloads, skill
-  bodies, plugin catalogs, repository configuration)
+  bodies, plugin catalogs, repository configuration, task notifications,
+  system reminders, local command output)
+
+What the user actually asked for is kept, including slash-command invocations
+and `!` bash input, though those never become a session title.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ _SYSTEM_BLOCK_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-# Codex injects these into role="user" records; Codex-scoped as the names are generic.
+# Each harness injects its own wrappers into role="user" records; names are generic, so scope per source.
 _CODEX_INJECTED_TAGS = (
     "codex_delegation",
     "realtime_delegation",
@@ -47,13 +51,31 @@ _CODEX_INJECTED_TAGS = (
     "turn_aborted",
     "user_action",
 )
-_CODEX_INJECTED_BLOCK_RE = re.compile(
-    r"<(?P<tag>" + "|".join(_CODEX_INJECTED_TAGS) + r")>.*?</(?P=tag)>",
-    re.IGNORECASE | re.DOTALL,
+# excludes command-*/bash-input: those carry user intent, so they stay searchable
+_CLAUDE_INJECTED_TAGS = (
+    "bash-stderr",
+    "bash-stdout",
+    "fork-boilerplate",
+    "local-command-caveat",
+    "local-command-stdout",
+    "system-reminder",
+    "task-notification",
 )
-_CODEX_UNCLOSED_BLOCK_RE = re.compile(
-    r"<(?:" + "|".join(_CODEX_INJECTED_TAGS) + r")>.*\Z",
-    re.IGNORECASE | re.DOTALL,
+
+
+def _injected_patterns(tags: tuple[str, ...]) -> tuple[re.Pattern, re.Pattern]:
+    joined = "|".join(tags)
+    return (
+        re.compile(rf"<(?P<tag>{joined})>.*?</(?P=tag)>", re.IGNORECASE | re.DOTALL),
+        re.compile(rf"<(?:{joined})>.*\Z", re.IGNORECASE | re.DOTALL),
+    )
+
+
+_CODEX_INJECTED_BLOCK_RE, _CODEX_UNCLOSED_BLOCK_RE = _injected_patterns(
+    _CODEX_INJECTED_TAGS
+)
+_CLAUDE_INJECTED_BLOCK_RE, _CLAUDE_UNCLOSED_BLOCK_RE = _injected_patterns(
+    _CLAUDE_INJECTED_TAGS
 )
 
 _SKIP_TITLE_PREFIXES = (
@@ -63,6 +85,10 @@ _SKIP_TITLE_PREFIXES = (
     "Explore the",
     "<environment_context>",
     "<INSTRUCTIONS>",
+    "<bash-input>",
+    "<command-args>",
+    "<command-message>",
+    "<command-name>",
 )
 
 
@@ -132,11 +158,24 @@ def _looks_like_system_prompt(text: str) -> bool:
     ))
 
 
+def _strip_injected(text: str, block_re: re.Pattern, unclosed_re: re.Pattern) -> str:
+    text = block_re.sub("", text)
+    # sanitize_text truncates before this runs, so an opener can outlive its closer
+    return unclosed_re.sub("", text).strip()
+
+
 def strip_codex_injected_context(text: str) -> str:
     """Return user text with Codex-injected wrapper blocks removed."""
-    text = _CODEX_INJECTED_BLOCK_RE.sub("", text)
-    # sanitize_text truncates before this runs, so an opener can outlive its closer
-    return _CODEX_UNCLOSED_BLOCK_RE.sub("", text).strip()
+    return _strip_injected(
+        text, _CODEX_INJECTED_BLOCK_RE, _CODEX_UNCLOSED_BLOCK_RE
+    )
+
+
+def strip_claude_injected_context(text: str) -> str:
+    """Return user text with Claude-harness wrapper blocks removed."""
+    return _strip_injected(
+        text, _CLAUDE_INJECTED_BLOCK_RE, _CLAUDE_UNCLOSED_BLOCK_RE
+    )
 
 
 def _detect_client(clients: list[str], prompts: list[str], project_name: str) -> str | None:
@@ -721,11 +760,18 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
                             pass
                     summaries.append(summary)
             elif entry_type in ("user", "assistant"):
-                exchange_count += 1
                 message = entry.get("message", {})
                 text, tool_names = _claude_text(
                     message.get("content", ""), assistant=entry_type == "assistant"
                 )
+                if entry_type == "user" and text:
+                    stripped = strip_claude_injected_context(text)
+                    if not stripped:
+                        # the record carried nothing but harness-injected context
+                        tool_tokens.result(message)
+                        continue
+                    text = stripped
+                exchange_count += 1
                 if entry_type == "assistant":
                     model = model or message.get("model")
                     # split rows repeat one response's id and usage; bill it once
@@ -832,8 +878,13 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
                 (entry.get("message") or {}).get("content", ""),
                 assistant=entry_type == "assistant",
             )
-            if entry_type == "user" and _looks_like_system_prompt(text):
-                continue
+            if entry_type == "user":
+                if _looks_like_system_prompt(text):
+                    continue
+                if text:
+                    text = strip_claude_injected_context(text)
+                    if not text:
+                        continue
             entries.append({
                 "type": entry_type,
                 "text": text,
