@@ -13,6 +13,7 @@ from session_index.analyzer import (
     analytics,
     format_context,
     get_context,
+    indexed_excerpts,
     synthesize,
 )
 from session_index.indexer import SCHEMA_VERSION, SessionIndexer
@@ -97,6 +98,20 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("Also check the amber scheduler.", data["fts_content"])
         self.assertEqual(data["title"], "Find the orange scheduler bug")
         self.assertEqual(data["exchange_count"], 3)
+
+    def test_codex_adapter_keeps_its_own_identity_and_counts_mcp_once(self):
+        path = next(CodexSourceAdapter(CODEX_ROOT).discover())
+        data = CodexSourceAdapter(CODEX_ROOT).parse(path)
+
+        # a subagent rollout replays its parent's meta; adopting it collides the rows
+        self.assertEqual(data["session_id"], "shared-session")
+        self.assertEqual(data["cwd"], "/Users/test/codex-demo")
+        self.assertEqual(data["start_time"], "2026-01-02T11:00:00Z")
+        # call-2 emits both a function_call and an mcp_tool_call_end
+        self.assertEqual(data["tools"], {
+            "shell_command": 1,
+            "linear.get_issue": 1,
+        })
 
     def test_codex_injected_block_survives_no_closing_tag(self):
         oversized = "plugin name " * (MAX_MESSAGE_CHARS // 6)
@@ -333,6 +348,29 @@ class DeletedTranscriptTests(unittest.TestCase):
         self.assertEqual(result["excerpts"], ["cobalt-needle stays"])
         self.assertIn("recovered from the index", format_context(result))
 
+    def test_indexed_excerpts_filter_on_an_invalid_regex(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript("""
+            CREATE VIRTUAL TABLE session_content USING fts5(
+                source, session_id, content
+            );
+        """)
+        conn.execute(
+            "INSERT INTO session_content VALUES (?, ?, ?)",
+            ("claude", "s1", "cobalt-needle stays\nunrelated filler line"),
+        )
+
+        try:
+            # "(unclosed" cannot compile; without a fallback every block matched
+            excerpts = indexed_excerpts(conn, "claude", "s1", query="(unclosed")
+            literal = indexed_excerpts(conn, "claude", "s1", query="cobalt-needle")
+        finally:
+            conn.close()
+
+        self.assertEqual(excerpts, [])
+        self.assertEqual(literal, ["cobalt-needle stays"])
+
 
 class MigrationTests(unittest.TestCase):
     def test_v1_database_is_backfilled_as_claude(self):
@@ -416,6 +454,46 @@ class MigrationTests(unittest.TestCase):
                 self.assertEqual(tuple(tool), ("claude", "Read"))
             finally:
                 indexer.close()
+
+    def test_empty_v1_database_stays_eligible_for_backfill(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            db_path = Path(tempdir) / "empty-legacy.db"
+            conn = sqlite3.connect(db_path)
+            conn.executescript("""
+                CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY,
+                    project TEXT, project_name TEXT, title TEXT,
+                    title_display TEXT, tags TEXT, client TEXT,
+                    file_path TEXT NOT NULL, file_size INTEGER,
+                    exchange_count INTEGER DEFAULT 0, start_time TEXT,
+                    end_time TEXT, duration_minutes INTEGER, model TEXT,
+                    has_compaction INTEGER DEFAULT 0,
+                    indexed_at TEXT NOT NULL, last_modified TEXT,
+                    file_hash TEXT
+                );
+            """)
+            conn.commit()
+            conn.close()
+
+            indexer = SessionIndexer(
+                db_path=db_path,
+                source_configs={
+                    "claude": {"enabled": True, "root": str(CLAUDE_ROOT)},
+                    "codex": {"enabled": False, "root": str(CODEX_ROOT)},
+                },
+            )
+            indexer.connect()
+            try:
+                initialized = {
+                    row[0] for row in indexer.conn.execute(
+                        "SELECT source FROM index_state"
+                    ).fetchall()
+                }
+            finally:
+                indexer.close()
+
+        # nothing was migrated, so the first run must still backfill claude
+        self.assertEqual(initialized, set())
 
 
 class ConfigTests(unittest.TestCase):

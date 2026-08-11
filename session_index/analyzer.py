@@ -61,6 +61,9 @@ def indexed_excerpts(conn: sqlite3.Connection, source: str, session_id: str,
             pattern = None
         if pattern:
             blocks = [block for block in blocks if pattern.search(block)]
+        else:
+            lowered = query.lower()
+            blocks = [block for block in blocks if lowered in block.lower()]
     return [block[:max_chars] for block in blocks[:limit]]
 
 

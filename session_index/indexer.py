@@ -257,10 +257,14 @@ class SessionIndexer:
                     SELECT 'claude', session_id, content
                     FROM session_content_migration
                 """)
-            self.conn.execute("""
-                INSERT OR REPLACE INTO index_state (source, initialized_at)
-                VALUES ('claude', ?)
-            """, (datetime.now().isoformat(),))
+            # an empty v1 db migrates nothing, so leave claude eligible for backfill
+            if self.conn.execute(
+                "SELECT 1 FROM sessions WHERE source='claude' LIMIT 1"
+            ).fetchone():
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO index_state (source, initialized_at)
+                    VALUES ('claude', ?)
+                """, (datetime.now().isoformat(),))
 
             for table in (
                 "session_topics_v1", "session_tools_v1",

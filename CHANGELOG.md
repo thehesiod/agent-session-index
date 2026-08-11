@@ -22,6 +22,16 @@
   skill bodies, plugin catalogs, and `AGENTS.md` repository configuration. These
   passed the sanitizer and were both searchable and picked as session titles, so
   sessions were named `<recommended_plugins>` rather than by their prompt.
+- Keep a Codex rollout's own identity. A subagent rollout replays its parent's
+  `session_meta`, and every such record overwrote the session id, cwd, start time,
+  and metadata — so children adopted the parent's id and collided onto one row,
+  silently dropping sessions. Only the first metadata record is now read.
+- Count an MCP invocation once. A single call emits both a `function_call` and an
+  `mcp_tool_call_end`, and each incremented the tool tally separately.
+- Leave an empty v1 database eligible for its first backfill instead of marking
+  Claude initialized when the migration moved no rows.
+- Fall back to literal matching when a `sessions context` query is not a valid
+  regex, rather than silently returning unfiltered text.
 - Derive Codex compaction from `compacted` records and `context_compacted` events.
   `turn_context.summary` is a setting whose value is `auto` or `none`, so reading it
   as a summary marked uncompacted sessions as compacted and stored the setting as

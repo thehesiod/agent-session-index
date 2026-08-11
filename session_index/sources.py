@@ -466,7 +466,10 @@ class CodexSourceAdapter(SessionSourceAdapter):
         agents: dict[str, int] = {}
         exchange_count = 0
         saw_compaction = False
+        saw_session_meta = False
         metadata: dict = {"format": "codex-rollout"}
+        # one MCP call emits both a function_call and an mcp_tool_call_end; key by call_id
+        codex_calls: dict[str, str] = {}
 
         for entry in _read_jsonl(path):
             timestamp = entry.get("timestamp")
@@ -477,6 +480,10 @@ class CodexSourceAdapter(SessionSourceAdapter):
             payload = entry.get("payload") or {}
 
             if entry_type == "session_meta":
+                # a subagent rollout replays its parent's meta; the first record is this session's
+                if saw_session_meta:
+                    continue
+                saw_session_meta = True
                 session_id = payload.get("id") or session_id
                 cwd = payload.get("cwd") or cwd
                 start_time = payload.get("timestamp") or start_time
@@ -520,7 +527,8 @@ class CodexSourceAdapter(SessionSourceAdapter):
                         payload.get("name") or item_type, 200
                     )
                     if name:
-                        tools[name] = tools.get(name, 0) + 1
+                        call_id = payload.get("call_id") or f"anon-{len(codex_calls)}"
+                        codex_calls.setdefault(call_id, name)
                     agent = _tool_agent_name(payload)
                     if agent:
                         agents[agent] = agents.get(agent, 0) + 1
@@ -540,7 +548,11 @@ class CodexSourceAdapter(SessionSourceAdapter):
                 tool = sanitize_text(invocation.get("tool", ""), 100)
                 name = ".".join(part for part in (server, tool) if part)
                 if name:
-                    tools[name] = tools.get(name, 0) + 1
+                    call_id = payload.get("call_id") or f"mcp-{len(codex_calls)}"
+                    codex_calls[call_id] = name
+
+        for name in codex_calls.values():
+            tools[name] = tools.get(name, 0) + 1
 
         project = cwd or path.parent.name
         project_name = Path(cwd).name if cwd else path.parent.name
