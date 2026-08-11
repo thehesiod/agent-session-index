@@ -17,7 +17,13 @@ from session_index.analyzer import (
 )
 from session_index.indexer import SCHEMA_VERSION, SessionIndexer
 from session_index.search import SessionSearch
-from session_index.sources import ClaudeSourceAdapter, CodexSourceAdapter
+from session_index.sources import (
+    MAX_MESSAGE_CHARS,
+    ClaudeSourceAdapter,
+    CodexSourceAdapter,
+    sanitize_text,
+    strip_codex_injected_context,
+)
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -72,6 +78,59 @@ class AdapterTests(unittest.TestCase):
         metadata = json.loads(data["metadata_json"])
         self.assertEqual(metadata["git"]["branch"], "fixture")
         self.assertNotIn("base_instructions", metadata)
+
+    def test_codex_adapter_excludes_injected_context(self):
+        path = next(CodexSourceAdapter(CODEX_ROOT).discover())
+        data = CodexSourceAdapter(CODEX_ROOT).parse(path)
+
+        for forbidden in (
+            "forbidden-injected-delegation",
+            "forbidden-injected-history",
+            "forbidden-injected-agents-md",
+            "forbidden-injected-plugins",
+            "forbidden-compaction-replacement",
+        ):
+            self.assertNotIn(forbidden, data["fts_content"])
+        # the AGENTS.md record leaks a filesystem path once its blocks are gone
+        self.assertNotIn("AGENTS.md instructions", data["fts_content"])
+        # a wrapper opening a record must be stripped, not drop the real prose
+        self.assertIn("Also check the amber scheduler.", data["fts_content"])
+        self.assertEqual(data["title"], "Find the orange scheduler bug")
+        self.assertEqual(data["exchange_count"], 3)
+
+    def test_codex_injected_block_survives_no_closing_tag(self):
+        oversized = "plugin name " * (MAX_MESSAGE_CHARS // 6)
+        text = sanitize_text(
+            f"<recommended_plugins>{oversized}</recommended_plugins>"
+        )
+
+        self.assertNotIn("</recommended_plugins>", text)
+        self.assertEqual(strip_codex_injected_context(text), "")
+
+    def test_codex_adapter_reads_compaction_from_records_not_settings(self):
+        path = next(CodexSourceAdapter(CODEX_ROOT).discover())
+        data = CodexSourceAdapter(CODEX_ROOT).parse(path)
+
+        self.assertEqual(data["has_compaction"], 1)
+        # turn_context.summary is a setting ("auto"/"none"), never a summary
+        self.assertEqual(data["topics"], [])
+
+    def test_codex_summary_setting_alone_is_not_compaction(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "sessions"
+            root.mkdir()
+            (root / "plain.jsonl").write_text(
+                json.dumps({
+                    "timestamp": "2026-01-02T11:00:00Z",
+                    "type": "turn_context",
+                    "payload": {"cwd": "/Users/test/demo", "summary": "none"},
+                }) + "\n"
+            )
+
+            data = CodexSourceAdapter(root).parse(root / "plain.jsonl")
+
+        self.assertEqual(data["has_compaction"], 0)
+        self.assertEqual(data["topics"], [])
 
     def test_codex_adapter_discovers_archived_rollouts(self):
         with tempfile.TemporaryDirectory() as tempdir:
@@ -138,8 +197,7 @@ class IndexIntegrationTests(unittest.TestCase):
                 "compaction_summary",
             )
             self.assertEqual(
-                search.topics("shared-session", source="codex")[0]["source"],
-                "rollout_summary",
+                search.topics("shared-session", source="codex"), []
             )
             self.assertEqual(search.stats()["by_source"], {
                 "claude": 1, "codex": 1,

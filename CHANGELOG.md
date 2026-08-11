@@ -18,6 +18,14 @@
   tools, topics, stats, and indexing commands.
 - Exclude developer/system instructions, reasoning records, tool outputs, and
   large encoded payloads from FTS.
+- Exclude the context Codex injects into user-role records — delegation payloads,
+  skill bodies, plugin catalogs, and `AGENTS.md` repository configuration. These
+  passed the sanitizer and were both searchable and picked as session titles, so
+  sessions were named `<recommended_plugins>` rather than by their prompt.
+- Derive Codex compaction from `compacted` records and `context_compacted` events.
+  `turn_context.summary` is a setting whose value is `auto` or `none`, so reading it
+  as a summary marked uncompacted sessions as compacted and stored the setting as
+  the session topic.
 - Keep all indexing and synthesis workflows local; transcript uploads are
   disabled.
 

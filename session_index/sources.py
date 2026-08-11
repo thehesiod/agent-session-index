@@ -7,6 +7,8 @@ by the SQLite index.  Deliberately excluded from indexed text:
 * encrypted or plaintext reasoning records
 * tool results and tool arguments
 * binary/data-URL payloads
+* context the agent injects into user-role records (delegation payloads, skill
+  bodies, plugin catalogs, repository configuration)
 """
 
 from __future__ import annotations
@@ -30,6 +32,26 @@ _SYSTEM_BLOCK_RE = re.compile(
     r"<(?:environment_context|permissions instructions|app-context|"
     r"collaboration_mode|INSTRUCTIONS)>.*?</(?:environment_context|"
     r"permissions instructions|app-context|collaboration_mode|INSTRUCTIONS)>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Codex injects these into role="user" records; Codex-scoped as the names are generic.
+_CODEX_INJECTED_TAGS = (
+    "codex_delegation",
+    "realtime_delegation",
+    "recommended_plugins",
+    "skill",
+    "subagent_notification",
+    "task",
+    "turn_aborted",
+    "user_action",
+)
+_CODEX_INJECTED_BLOCK_RE = re.compile(
+    r"<(?P<tag>" + "|".join(_CODEX_INJECTED_TAGS) + r")>.*?</(?P=tag)>",
+    re.IGNORECASE | re.DOTALL,
+)
+_CODEX_UNCLOSED_BLOCK_RE = re.compile(
+    r"<(?:" + "|".join(_CODEX_INJECTED_TAGS) + r")>.*\Z",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -105,7 +127,15 @@ def _looks_like_system_prompt(text: str) -> bool:
         "<environment_context>",
         "<INSTRUCTIONS>",
         "# AGENTS.md instructions",
+        "The following is the Codex agent history",
     ))
+
+
+def strip_codex_injected_context(text: str) -> str:
+    """Return user text with Codex-injected wrapper blocks removed."""
+    text = _CODEX_INJECTED_BLOCK_RE.sub("", text)
+    # sanitize_text truncates before this runs, so an opener can outlive its closer
+    return _CODEX_UNCLOSED_BLOCK_RE.sub("", text).strip()
 
 
 def _detect_client(clients: list[str], prompts: list[str], project_name: str) -> str | None:
@@ -428,6 +458,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
         tools: dict[str, int] = {}
         agents: dict[str, int] = {}
         exchange_count = 0
+        saw_compaction = False
         metadata: dict = {"format": "codex-rollout"}
 
         for entry in _read_jsonl(path):
@@ -451,8 +482,11 @@ class CodexSourceAdapter(SessionSourceAdapter):
             elif entry_type == "turn_context":
                 cwd = payload.get("cwd") or cwd
                 model = payload.get("model") or model
+                # payload["summary"] is a setting ("auto"/"none"), not a summary
+            elif entry_type == "compacted":
+                saw_compaction = True
                 summary = sanitize_text(
-                    payload.get("summary", ""), MAX_SUMMARY_CHARS
+                    payload.get("message", ""), MAX_SUMMARY_CHARS
                 )
                 if summary and summary not in summaries:
                     summaries.append(summary)
@@ -460,9 +494,13 @@ class CodexSourceAdapter(SessionSourceAdapter):
                 item_type = payload.get("type")
                 if item_type == "message" and payload.get("role") in ("user", "assistant"):
                     text = _codex_message_text(payload)
+                    role = payload["role"]
+                    if role == "user":
+                        text = strip_codex_injected_context(text)
+                        if _looks_like_system_prompt(text):
+                            continue
                     if not text:
                         continue
-                    role = payload["role"]
                     exchange_count += 1
                     if role == "user":
                         user_prompts.append(text)
@@ -483,6 +521,11 @@ class CodexSourceAdapter(SessionSourceAdapter):
                 # intentionally excluded.
             elif (
                 entry_type == "event_msg"
+                and payload.get("type") == "context_compacted"
+            ):
+                saw_compaction = True
+            elif (
+                entry_type == "event_msg"
                 and payload.get("type") == "mcp_tool_call_end"
             ):
                 invocation = payload.get("invocation") or {}
@@ -497,7 +540,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
         title = _pick_title(user_prompts)
         topics = [{
             "topic": summary.splitlines()[0][:120],
-            "source": "rollout_summary",
+            "source": "compaction_summary",
             "captured_at": end_time or datetime.now().isoformat(),
             "exchange_number": None,
         } for summary in summaries if summary.strip()]
@@ -519,7 +562,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
             "end_time": end_time,
             "duration_minutes": _duration_minutes(start_time, end_time),
             "model": model,
-            "has_compaction": int(bool(summaries)),
+            "has_compaction": int(saw_compaction),
             "metadata_json": json.dumps(metadata, sort_keys=True),
             "tools": tools,
             "agents": agents,
@@ -553,6 +596,10 @@ class CodexSourceAdapter(SessionSourceAdapter):
             role = payload.get("role")
             if item_type == "message" and role in ("user", "assistant"):
                 text = _codex_message_text(payload)
+                if role == "user":
+                    text = strip_codex_injected_context(text)
+                    if _looks_like_system_prompt(text):
+                        continue
                 if text:
                     entries.append({
                         "type": role,
