@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Session analyzer — context retrieval, analytics, and cross-session synthesis.
+Agent session analyzer — local context retrieval and analytics.
 
 Three capabilities on top of the session index:
   A. context   — read JSONL, extract full conversation exchanges around a match
   B. analytics — pure SQL aggregations (time per client, tool trends, etc.)
-  C. synthesize — search + read matching sessions + Haiku synthesis
+  C. synthesize — disabled so transcripts never leave the machine
 
 Usage:
     python3 -m session_index.analyzer context <session_id> "search term"
@@ -13,203 +13,62 @@ Usage:
     python3 -m session_index.analyzer synthesize "query" [--limit 10]
 """
 
-import json
-import os
 import re
 import sys
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional
 
 try:
     from . import config
+    from .sources import extract_exchanges_for_source
+    from .search import resume_command
 except ImportError:
     import config
+    from sources import extract_exchanges_for_source
+    from search import resume_command
 
 # ---------------------------------------------------------------------------
 # A. Context retrieval — JSONL parsing
 # ---------------------------------------------------------------------------
 
-def _summarize_tool_call(item: dict) -> str:
-    """Collapse a tool_use block into a one-liner."""
-    name = item.get("name", "unknown")
-    inp = item.get("input", {})
-
-    if name == "Read":
-        return f"[Read: {inp.get('file_path', '?')}]"
-    elif name == "Edit":
-        fp = inp.get("file_path", "?")
-        old = (inp.get("old_string") or "")[:40]
-        return f"[Edit: {fp} ({old}...)]"
-    elif name == "Write":
-        return f"[Write: {inp.get('file_path', '?')}]"
-    elif name == "Bash":
-        cmd = (inp.get("command") or "")[:60]
-        return f"[Bash: {cmd}]"
-    elif name == "Task":
-        desc = inp.get("description", "")
-        atype = inp.get("subagent_type", "")
-        return f'[Task: "{desc}" → {atype}]'
-    elif name == "Grep":
-        return f"[Grep: {inp.get('pattern', '?')}]"
-    elif name == "Glob":
-        return f"[Glob: {inp.get('pattern', '?')}]"
-    elif name == "WebFetch":
-        return f"[WebFetch: {inp.get('url', '?')[:60]}]"
-    elif name == "WebSearch":
-        return f"[WebSearch: {inp.get('query', '?')}]"
-    else:
-        return f"[{name}]"
-
-
-def _extract_assistant_text(content) -> str:
-    """Extract readable text from an assistant message's content blocks."""
-    if isinstance(content, str):
-        return content
-
-    parts = []
-    for block in (content or []):
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") == "text":
-            text = block.get("text", "")
-            if text and text != "(no content)":
-                parts.append(text)
-        elif block.get("type") == "tool_use":
-            parts.append(_summarize_tool_call(block))
-
-    return "\n".join(parts)
-
-
-def _extract_user_text(content) -> str:
-    """Extract readable text from a user message's content."""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        texts = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                texts.append(item.get("text", ""))
-            elif isinstance(item, str):
-                texts.append(item)
-        return " ".join(texts)
-    return str(content)
-
-
 def extract_exchanges(session_path: str | Path, query: str = None,
-                      limit: int = 10, max_chars: int = 1000) -> list[dict]:
-    """Extract user+assistant exchange pairs from JSONL.
+                      limit: int = 10, max_chars: int = 1000,
+                      source: str = "claude") -> list[dict]:
+    """Extract exchanges using the parser for the indexed source."""
+    return extract_exchanges_for_source(
+        source, session_path, query=query, limit=limit, max_chars=max_chars
+    )
 
-    If query provided, only return exchanges where user message matches.
-    Returns list of {user: str, assistant: str, timestamp: str} dicts.
-    """
-    path = Path(session_path)
-    if not path.exists():
+
+def indexed_excerpts(conn: sqlite3.Connection, source: str, session_id: str,
+                     query: str = None, limit: int = 10,
+                     max_chars: int = 1000) -> list[str]:
+    """Recover readable text for a deleted transcript from the index itself."""
+    row = conn.execute(
+        "SELECT content FROM session_content WHERE source=? AND session_id=?",
+        (source, session_id),
+    ).fetchone()
+    if not row or not row["content"]:
         return []
 
-    # First pass: collect ordered entries
-    entries = []
-    try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                etype = entry.get("type")
-                if etype not in ("user", "assistant"):
-                    continue
-
-                msg = entry.get("message", {})
-                content = msg.get("content", "")
-                ts = entry.get("timestamp", "")
-
-                if etype == "user":
-                    text = _extract_user_text(content)
-                else:
-                    text = _extract_assistant_text(content)
-
-                entries.append({
-                    "type": etype,
-                    "text": text,
-                    "timestamp": ts,
-                })
-    except Exception as e:
-        print(f"Error reading {path}: {e}", file=sys.stderr)
-        return []
-
-    # Pair consecutive user → assistant messages
-    exchanges = []
-    i = 0
-    while i < len(entries):
-        if entries[i]["type"] == "user":
-            user_text = entries[i]["text"]
-            user_ts = entries[i]["timestamp"]
-            assistant_text = ""
-
-            # Collect all assistant messages until next user message
-            j = i + 1
-            assistant_parts = []
-            while j < len(entries) and entries[j]["type"] == "assistant":
-                assistant_parts.append(entries[j]["text"])
-                j += 1
-            assistant_text = "\n".join(assistant_parts)
-
-            exchanges.append({
-                "user": user_text,
-                "assistant": assistant_text,
-                "timestamp": user_ts,
-            })
-            i = j
-        else:
-            i += 1
-
-    # Filter by query if provided
+    blocks = [block.strip() for block in row["content"].split("\n")]
+    blocks = [block for block in blocks if block]
     if query:
-        # Try regex first, then substring, then individual words
-        matched = None
         try:
             pattern = re.compile(query, re.IGNORECASE)
-            matched = [
-                ex for ex in exchanges
-                if pattern.search(ex["user"]) or pattern.search(ex["assistant"])
-            ]
         except re.error:
-            pass
-
-        if not matched:
-            q = query.lower()
-            matched = [
-                ex for ex in exchanges
-                if q in ex["user"].lower() or q in ex["assistant"].lower()
-            ]
-
-        # If exact match fails, try matching ANY word from the query
-        if not matched:
-            words = [w.lower() for w in query.split() if len(w) > 2]
-            if words:
-                matched = [
-                    ex for ex in exchanges
-                    if any(w in ex["user"].lower() or w in ex["assistant"].lower()
-                           for w in words)
-                ]
-
-        exchanges = matched or []
-
-    # Truncate long messages
-    for ex in exchanges:
-        if len(ex["user"]) > max_chars:
-            ex["user"] = ex["user"][:max_chars] + "..."
-        if len(ex["assistant"]) > max_chars:
-            ex["assistant"] = ex["assistant"][:max_chars] + "..."
-
-    return exchanges[:limit]
+            pattern = None
+        if pattern:
+            blocks = [block for block in blocks if pattern.search(block)]
+        else:
+            lowered = query.lower()
+            blocks = [block for block in blocks if lowered in block.lower()]
+    return [block[:max_chars] for block in blocks[:limit]]
 
 
 def get_context(session_id: str, query: str = None, limit: int = 10,
-                db_path: Path = None) -> dict:
+                db_path: Path = None, source: str = None) -> dict:
     """Get conversation context for a session.
 
     Returns dict with session info + matching exchanges.
@@ -220,37 +79,58 @@ def get_context(session_id: str, query: str = None, limit: int = 10,
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
 
-    # Resolve partial session ID
-    if len(session_id) < 36:
-        row = conn.execute(
-            "SELECT session_id, file_path, title_display, project_name, client, "
-            "start_time, exchange_count, duration_minutes "
-            "FROM sessions WHERE session_id LIKE ?",
-            (f"{session_id}%",)
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT session_id, file_path, title_display, project_name, client, "
-            "start_time, exchange_count, duration_minutes "
-            "FROM sessions WHERE session_id = ?",
-            (session_id,)
-        ).fetchone()
+    if ":" in session_id and not source:
+        prefix, value = session_id.split(":", 1)
+        if prefix in ("claude", "codex"):
+            source, session_id = prefix, value
+    clauses = ["session_id LIKE ?"]
+    params = [f"{session_id}%"]
+    if source:
+        clauses.append("source=?")
+        params.append(source)
+    try:
+        rows = conn.execute(
+            "SELECT source, session_id, file_path, title_display, project_name, "
+            "client, start_time, exchange_count, duration_minutes "
+            f"FROM sessions WHERE {' AND '.join(clauses)} "
+            "ORDER BY CASE WHEN session_id=? THEN 0 ELSE 1 END LIMIT 2",
+            [*params, session_id],
+        ).fetchall()
 
-    conn.close()
+        if not rows:
+            return {"error": f"Session not found: {session_id}"}
+        if len(rows) > 1:
+            return {
+                "error": (
+                    f"Session prefix is ambiguous: {session_id}. "
+                    "Pass --source claude or --source codex."
+                )
+            }
 
-    if not row:
-        return {"error": f"Session not found: {session_id}"}
-
-    session_info = dict(row)
-    exchanges = extract_exchanges(
-        session_info["file_path"], query=query, limit=limit
-    )
+        session_info = dict(rows[0])
+        transcript_missing = not Path(session_info["file_path"]).exists()
+        exchanges: list[dict] = []
+        excerpts: list[str] = []
+        if transcript_missing:
+            excerpts = indexed_excerpts(
+                conn, session_info["source"], session_info["session_id"],
+                query=query, limit=limit,
+            )
+        else:
+            exchanges = extract_exchanges(
+                session_info["file_path"], query=query, limit=limit,
+                source=session_info["source"],
+            )
+    finally:
+        conn.close()
 
     return {
         "session": session_info,
         "query": query,
         "exchanges": exchanges,
-        "total_matches": len(exchanges),
+        "excerpts": excerpts,
+        "transcript_missing": transcript_missing,
+        "total_matches": len(exchanges) + len(excerpts),
     }
 
 
@@ -275,8 +155,23 @@ def format_context(result: dict) -> str:
     if s.get('duration_minutes'):
         meta.append(f"{s['duration_minutes']}min")
     lines.append(f"│ {' · '.join(meta)}")
-    lines.append(f"│ → claude --resume {s['session_id']}")
+    lines.append(f"│ source: {s['source']}")
+    lines.append(f"│ → {resume_command(s['source'], s['session_id'])}")
     lines.append(f"╰{'─' * 48}")
+
+    if result.get("transcript_missing"):
+        lines.append(
+            "\n⚠ transcript file is gone — showing text recovered from the index"
+        )
+        if result["query"]:
+            lines.append(f"\nMatching text for \"{result['query']}\":\n")
+        else:
+            lines.append(f"\nIndexed text ({result['total_matches']} shown):\n")
+        if not result.get("excerpts"):
+            lines.append("  (no text was stored for this session)")
+        for block in result.get("excerpts") or []:
+            lines.append(f"  │ {block}")
+        return "\n".join(lines)
 
     if result["query"]:
         lines.append(f"\nMatching exchanges for \"{result['query']}\":\n")
@@ -324,14 +219,14 @@ def format_context(result: dict) -> str:
 
 def analytics(client: str = None, project: str = None,
               week: bool = False, month: bool = False,
-              db_path: Path = None) -> dict:
+              db_path: Path = None, source: str = None) -> dict:
     """Run analytics queries against sessions.db. Returns structured dict."""
     if db_path is None:
         db_path = config.get_db_path()
 
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
-    results = {}
+    results = {"source": source or "all"}
 
     # Period filter
     period_clause = ""
@@ -362,8 +257,15 @@ def analytics(client: str = None, project: str = None,
         project_clause = "AND (s.project_name LIKE ? OR s.project LIKE ?)"
         project_params = [f"%{project}%", f"%{project}%"]
 
-    base_where = f"WHERE 1=1 {period_clause} {client_clause} {project_clause}"
-    base_params = period_params + client_params + project_params
+    source_clause = "AND s.source = ?" if source else ""
+    source_params = [source] if source else []
+    base_where = (
+        f"WHERE 1=1 {period_clause} {client_clause} "
+        f"{project_clause} {source_clause}"
+    )
+    base_params = (
+        period_params + client_params + project_params + source_params
+    )
 
     # 1. Time per client
     rows = conn.execute(f"""
@@ -377,13 +279,14 @@ def analytics(client: str = None, project: str = None,
     results["time_per_client"] = [dict(r) for r in rows]
 
     # 2. Session frequency (last 14 days, ignoring period filter)
-    rows = conn.execute("""
-        SELECT date(start_time) as day, COUNT(*) as sessions,
-               SUM(duration_minutes) as minutes
-        FROM sessions
-        WHERE start_time >= date('now', '-14 days')
+    rows = conn.execute(f"""
+        SELECT date(s.start_time) as day, COUNT(*) as sessions,
+               SUM(s.duration_minutes) as minutes
+        FROM sessions s
+        WHERE s.start_time >= date('now', '-14 days')
+        {"AND s.source=?" if source else ""}
         GROUP BY day ORDER BY day
-    """).fetchall()
+    """, source_params).fetchall()
     results["daily_trend"] = [dict(r) for r in rows]
 
     # 3. Overall stats for period
@@ -401,9 +304,11 @@ def analytics(client: str = None, project: str = None,
     # 4. Top tools (period-aware)
     rows = conn.execute(f"""
         SELECT st.tool_name, SUM(st.use_count) as total,
-               COUNT(DISTINCT st.session_id) as session_count
+               COUNT(DISTINCT st.session_source || ':' || st.session_id)
+                   as session_count
         FROM session_tools st
-        JOIN sessions s ON s.session_id = st.session_id
+        JOIN sessions s
+          ON s.source = st.session_source AND s.session_id = st.session_id
         {base_where}
         GROUP BY st.tool_name ORDER BY total DESC LIMIT 15
     """, base_params).fetchall()
@@ -412,25 +317,31 @@ def analytics(client: str = None, project: str = None,
     # 5. Tool trends: this week vs last week
     this_week_start = (datetime.now() - timedelta(days=7)).isoformat()
     last_week_start = (datetime.now() - timedelta(days=14)).isoformat()
-    rows = conn.execute("""
+    rows = conn.execute(f"""
         SELECT tool_name,
                SUM(CASE WHEN s.start_time >= ? THEN use_count ELSE 0 END) as this_week,
                SUM(CASE WHEN s.start_time >= ? AND s.start_time < ? THEN use_count ELSE 0 END) as last_week
         FROM session_tools st
-        JOIN sessions s ON s.session_id = st.session_id
+        JOIN sessions s
+          ON s.source = st.session_source AND s.session_id = st.session_id
         WHERE s.start_time >= ?
+          {"AND s.source=?" if source else ""}
         GROUP BY tool_name
         HAVING this_week > 0 OR last_week > 0
         ORDER BY this_week DESC
         LIMIT 15
-    """, (this_week_start, last_week_start, this_week_start, last_week_start)).fetchall()
+    """, (
+        this_week_start, last_week_start, this_week_start, last_week_start,
+        *source_params,
+    )).fetchall()
     results["tool_trends"] = [dict(r) for r in rows]
 
     # 6. Most-discussed topics
     rows = conn.execute(f"""
         SELECT st.topic, COUNT(*) as mentions, st.source
         FROM session_topics st
-        JOIN sessions s ON s.session_id = st.session_id
+        JOIN sessions s
+          ON s.source = st.session_source AND s.session_id = st.session_id
         {base_where}
         GROUP BY st.topic
         ORDER BY mentions DESC
@@ -457,7 +368,9 @@ def format_analytics(data: dict) -> str:
     lines = []
 
     period = data.get("period", "all time")
-    lines.append(f"\nSession analytics — {period}")
+    lines.append(
+        f"\nSession analytics — {period} · source: {data.get('source', 'all')}"
+    )
     lines.append("═" * 50)
 
     # Overview
@@ -538,135 +451,21 @@ def format_analytics(data: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# C. Cross-session synthesis — Haiku
+# C. Cross-session synthesis policy
 # ---------------------------------------------------------------------------
 
 def synthesize(query: str, limit: int = 10, max_excerpt_chars: int = 2000,
                db_path: Path = None) -> dict:
-    """Search sessions, extract relevant exchanges, synthesize with Haiku.
-
-    Returns dict with synthesis text + source session references.
-    Requires ANTHROPIC_API_KEY environment variable and the anthropic SDK.
-    """
-    if db_path is None:
-        db_path = config.get_db_path()
-
-    # Import Anthropic SDK — graceful degradation if unavailable
-    try:
-        from anthropic import Anthropic
-
-        def haiku_ask(prompt, system="You are a fast, precise assistant.", max_tokens=2048):
-            client = Anthropic()
-            response = client.messages.create(
-                model="claude-3-5-haiku-20241022",
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            return response.content[0].text
-    except ImportError:
-        return {
-            "error": "Synthesis requires the Anthropic SDK. Install with: pip install anthropic",
-            "sessions": [],
-            "synthesis": None,
-        }
-
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return {
-            "error": "ANTHROPIC_API_KEY environment variable is required for synthesis.",
-            "sessions": [],
-            "synthesis": None,
-        }
-
-    # Step 1: Search for matching sessions via FTS
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
-
-    rows = conn.execute("""
-        SELECT s.session_id, s.file_path, s.title_display, s.project_name,
-               s.client, s.start_time, s.exchange_count, s.duration_minutes,
-               snippet(session_content, 1, '>>>', '<<<', '...', 30) as snippet
-        FROM session_content
-        JOIN sessions s ON s.session_id = session_content.session_id
-        WHERE session_content MATCH ?
-        ORDER BY rank
-        LIMIT ?
-    """, (query, limit)).fetchall()
-
-    conn.close()
-
-    if not rows:
-        return {
-            "error": f"No sessions found matching: {query}",
-            "sessions": [],
-            "synthesis": None,
-        }
-
-    # Step 2: Extract relevant exchanges from each matching session
-    session_excerpts = []
-    sources = []
-    for row in rows:
-        info = dict(row)
-        sources.append({
-            "session_id": info["session_id"],
-            "title": info.get("title_display") or "(unnamed)",
-            "date": (info.get("start_time") or "")[:10],
-            "project": info.get("project_name", ""),
-            "client": info.get("client", ""),
-        })
-
-        exchanges = extract_exchanges(
-            info["file_path"], query=query, limit=5, max_chars=max_excerpt_chars
-        )
-
-        if exchanges:
-            excerpt_lines = []
-            title = info.get("title_display") or info["session_id"][:8]
-            date = (info.get("start_time") or "")[:10]
-            excerpt_lines.append(f"### Session: {title} ({date})")
-            for ex in exchanges:
-                excerpt_lines.append(f"User: {ex['user']}")
-                excerpt_lines.append(f"Assistant: {ex['assistant']}")
-                excerpt_lines.append("")
-            session_excerpts.append("\n".join(excerpt_lines))
-
-    if not session_excerpts:
-        return {
-            "error": "Found sessions but couldn't extract relevant exchanges.",
-            "sessions": sources,
-            "synthesis": None,
-        }
-
-    # Step 3: Build synthesis prompt
-    formatted_excerpts = "\n---\n".join(session_excerpts)
-
-    # Trim total context to ~20K chars for Haiku
-    if len(formatted_excerpts) > 20000:
-        formatted_excerpts = formatted_excerpts[:20000] + "\n[...truncated]"
-
-    system_prompt = "You are analyzing Claude Code session excerpts. Be specific — reference actual solutions, file names, tools used. Keep it concise (under 500 words)."
-
-    user_prompt = f"""Given the following conversation excerpts about "{query}", synthesize:
-
-1. **Approaches tried** — What solutions or methods were attempted?
-2. **What worked** — Which approaches succeeded? Key decisions that helped?
-3. **What failed** — What was abandoned or didn't work? Why?
-4. **Recurring patterns** — Any themes, repeated issues, or evolving understanding?
-5. **Current state** — Where did things land? What's the latest?
-
---- EXCERPTS ---
-{formatted_excerpts}"""
-
-    # Step 4: Call Haiku
-    synthesis = haiku_ask(user_prompt, system=system_prompt, max_tokens=2048)
-
+    """Refuse network synthesis so local transcripts never leave the machine."""
     return {
-        "query": query,
-        "sessions": sources,
-        "synthesis": synthesis,
-        "excerpt_count": len(session_excerpts),
+        "error": (
+            "Network synthesis is disabled: Agent Session Index never uploads "
+            "session content. Search and retrieve local context, then synthesize "
+            "within your current agent conversation."
+        ),
+        "sessions": [],
+        "synthesis": None,
     }
-
 
 def format_synthesis(result: dict) -> str:
     """Format synthesis result for CLI output."""
@@ -687,7 +486,9 @@ def format_synthesis(result: dict) -> str:
             if len(title) > 55:
                 title = title[:52] + "..."
             lines.append(f"    {s['date']}  {title}")
-            lines.append(f"             → claude --resume {s['session_id']}")
+            lines.append(
+                f"             → {resume_command(s.get('source', 'claude'), s['session_id'])}"
+            )
 
     # Synthesis
     if result.get("synthesis"):
@@ -713,6 +514,7 @@ def main():
     sp.add_argument("session_id", help="Session ID (full or prefix)")
     sp.add_argument("query", nargs="?", default=None, help="Filter to matching exchanges")
     sp.add_argument("-n", "--limit", type=int, default=10, help="Max exchanges to show")
+    sp.add_argument("--source", choices=("claude", "codex"))
 
     # analytics
     sp = subparsers.add_parser("analytics", help="Session analytics")
@@ -720,9 +522,12 @@ def main():
     sp.add_argument("--project", help="Filter by project")
     sp.add_argument("--week", action="store_true", help="This week only")
     sp.add_argument("--month", action="store_true", help="This month only")
+    sp.add_argument("--source", choices=("claude", "codex"))
 
     # synthesize
-    sp = subparsers.add_parser("synthesize", help="Cross-session synthesis via Haiku")
+    sp = subparsers.add_parser(
+        "synthesize", help="Explain the local-only synthesis policy"
+    )
     sp.add_argument("query", help="Topic to synthesize across sessions")
     sp.add_argument("--limit", type=int, default=10, help="Max sessions to analyze")
 
@@ -741,14 +546,14 @@ def main():
 
     if args.command == "context":
         result = get_context(args.session_id, query=args.query, limit=args.limit,
-                             db_path=db_path)
+                             db_path=db_path, source=args.source)
         print(format_context(result))
 
     elif args.command == "analytics":
         result = analytics(
             client=args.client, project=args.project,
             week=args.week, month=args.month,
-            db_path=db_path,
+            db_path=db_path, source=args.source,
         )
         print(format_analytics(result))
 

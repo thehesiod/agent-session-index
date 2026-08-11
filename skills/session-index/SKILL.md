@@ -1,101 +1,102 @@
 ---
 name: session-index
-description: Search, analyze, and synthesize across all your Claude Code sessions. Ask "what did I try last time?" and get answers with resume links.
-version: 0.3.1
+description: Search and synthesize across local Claude Code and Codex sessions through the unified Agent Session Index. Use for questions such as "what did I try last time?" and return source-aware resume commands.
+version: 0.4.0
 author: Lee Fuhr
 tags:
   - session-search
   - session-history
+  - claude
+  - codex
   - analytics
   - memory
-  - productivity
 requires:
   - python3
   - pip
 ---
 
-# Session index skill
+# Agent Session Index skill
 
-You have access to a session index — a SQLite database with FTS5 full-text search across all Claude Code sessions. Use it whenever the user asks about past sessions, previous conversations, or wants to know what they've tried before.
+Use the local `sessions` CLI whenever the user asks about past agent sessions,
+previous conversations, earlier attempts, or historical tool usage. The CLI
+queries one private SQLite/FTS index containing both Claude Code and Codex
+transcripts.
 
-**The user's interface is this conversation.** They ask naturally ("Didn't we discuss browser control recently?"), you translate to CLI commands, and present results conversationally. They should never need to know the CLI syntax.
+Do not upload transcript content or call an external synthesis API.
 
-## How to handle session queries
+## Workflow
 
-### 1. Extract keywords from the question
-
-The user says: "Didn't we discuss browser control recently?"
-You search: `sessions "browser control"`
-
-The user says: "What approaches have I tried for form automation?"
-You search: `sessions "form automation"`
-
-The user says: "How much time did I spend on Acme this week?"
-You run: `sessions analytics --client "Acme" --week`
-
-### 2. Run the right command via Bash
-
-**Search** — find sessions by topic:
-```bash
-sessions "relevant keywords"
-sessions "relevant keywords" --context    # includes conversation excerpts
-```
-
-**Context** — read the actual conversation from a session:
-```bash
-sessions context <session_id> "search term"   # exchanges matching a term
-sessions context <session_id>                 # all exchanges
-```
-
-**Analytics** — effort, time, tool usage:
-```bash
-sessions analytics                    # overall
-sessions analytics --client "Acme"    # per client
-sessions analytics --week             # this week
-sessions analytics --month            # this month
-```
-
-**Filter** — find sessions by metadata:
-```bash
-sessions find --client "Acme"              # by client
-sessions find --tool Task --week           # by tool + date
-sessions find --project myapp              # by project
-sessions recent 20                         # last N sessions
-```
-
-### 3. For synthesis ("what worked?", "what have I tried?")
-
-This is the most valuable capability. When the user asks a question that spans multiple sessions:
-
-1. Search: `sessions "topic" -n 10`
-2. For the top 3-5 results, extract context: `sessions context <id> "topic" -n 3`
-3. Spawn a Task with `model="haiku"` to synthesize:
-   - What approaches were tried?
-   - What worked / what failed?
-   - Recurring patterns?
-   - Current state?
-4. Present the synthesis conversationally with `claude --resume <id>` links for each source session
-
-This uses an in-session Haiku subagent — no external API key needed.
-
-### 4. Present results conversationally
-
-Don't dump raw CLI output. Summarize:
-- "You discussed browser control in 3 sessions last week..."
-- "The main approach that worked was..."
-- Include `claude --resume <session_id>` links so they can jump back in
-- If context is relevant, quote key exchanges
-
-## Installation
+1. Extract a compact search phrase from the user's question.
+2. Run the unified CLI:
 
 ```bash
-pip install claude-session-index
+sessions "relevant keywords" -n 10
 ```
 
-First run of any command auto-indexes all existing sessions.
+3. If results are noisy, use source or metadata filters:
 
-## Data location
+```bash
+sessions "relevant keywords" --source codex
+sessions find --project myapp --week --source claude
+sessions find --tool shell_command --source codex
+sessions recent 20 --source codex
+```
 
-- **Database:** `~/.session-index/sessions.db`
-- **Topics:** `~/.claude/session-topics/`
-- **Config:** `~/.session-index/config.json` (optional)
+4. Retrieve the actual exchanges for the most relevant results. Always pass the
+   source shown in the result so the CLI uses the correct transcript parser:
+
+```bash
+sessions context <session_id> "search term" --source codex
+sessions context <session_id> "search term" --source claude
+```
+
+5. Synthesize the retrieved excerpts inside the current Codex or Claude Code
+   conversation. Summarize:
+
+   - approaches tried
+   - what worked and failed
+   - recurring decisions or constraints
+   - latest known state
+
+6. Cite each historical source using the resume command printed by the CLI:
+
+```text
+claude --resume <session_id>
+codex resume <session_id>
+```
+
+Present a concise answer rather than dumping raw CLI output. Clearly distinguish
+facts from Claude sessions and Codex sessions when that matters.
+
+## Analytics
+
+```bash
+sessions analytics
+sessions analytics --week --source codex
+sessions analytics --client "Acme" --source claude
+sessions tools --source codex
+sessions stats
+```
+
+## Installation and data
+
+```bash
+pip install agent-session-index
+sessions index --backfill
+```
+
+- Database: `~/.session-index/sessions.db`
+- Claude transcripts: `~/.claude/projects`
+- Codex transcripts: `~/.codex/sessions` and `~/.codex/archived_sessions`
+- Config: `~/.session-index/config.json`
+
+The first command migrates an existing Claude-only database safely and
+initializes newly enabled sources. Indexing and retrieval remain local.
+
+Archived sessions stay searchable. Claude Desktop's Archive only flags its own
+sidebar record and leaves the transcript in `~/.claude/projects`; `codex` moves the
+rollout into `archived_sessions/`, which is indexed as a second Codex root.
+
+A *deleted* transcript still searches, because its indexed text lives in the database.
+`sessions context` says the file is gone and falls back to that text, so the messages
+read back without user/assistant pairing or tool calls.

@@ -1,0 +1,17 @@
+{"timestamp":"2026-01-02T11:00:00Z","type":"session_meta","payload":{"id":"shared-session","timestamp":"2026-01-02T11:00:00Z","cwd":"/Users/test/codex-demo","model_provider":"openai","originator":"codex_cli_rs","git":{"branch":"fixture","commit_hash":"abc123"},"base_instructions":"forbidden-codex-base-instructions"}}
+{"timestamp":"2026-01-02T11:00:01Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"forbidden-codex-developer"}]}}
+{"timestamp":"2026-01-02T11:00:02Z","type":"turn_context","payload":{"cwd":"/Users/test/codex-demo","model":"gpt-test","summary":"auto"}}
+{"timestamp":"2026-01-02T11:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<codex_delegation>forbidden-injected-delegation</codex_delegation>"}]}}
+{"timestamp":"2026-01-02T11:00:04Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"The following is the Codex agent history added since your last approval.\nforbidden-injected-history"}]}}
+{"timestamp":"2026-01-02T11:00:05Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /Users/test/codex-demo\n\n<INSTRUCTIONS>forbidden-injected-agents-md</INSTRUCTIONS>"}]}}
+{"timestamp":"2026-01-02T11:00:06Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Find the orange scheduler bug <environment_context>forbidden-environment-context</environment_context>"}]}}
+{"timestamp":"2026-01-02T11:00:08Z","type":"response_item","payload":{"type":"reasoning","encrypted_content":"forbidden-encrypted-reasoning","summary":[{"type":"summary_text","text":"forbidden-reasoning-summary"}]}}
+{"timestamp":"2026-01-02T11:00:09Z","type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\"cmd\":\"cat huge-binary-tool-payload\"}","call_id":"call-1"}}
+{"timestamp":"2026-01-02T11:00:10Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"forbidden-tool-output"}}
+{"timestamp":"2026-01-02T11:00:11Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"The Codex-only answer is amber-needle."}]}}
+{"timestamp":"2026-01-02T11:00:11Z","type":"session_meta","payload":{"id":"parent-session","timestamp":"2026-01-02T09:00:00Z","cwd":"/Users/test/parent-demo"}}
+{"timestamp":"2026-01-02T11:00:11Z","type":"response_item","payload":{"type":"function_call","name":"mcp_call","arguments":"{}","call_id":"call-2"}}
+{"timestamp":"2026-01-02T11:00:12Z","type":"event_msg","payload":{"type":"mcp_tool_call_end","call_id":"call-2","duration":"1ms","invocation":{"server":"linear","tool":"get_issue","arguments":{"id":"forbidden-mcp-arguments"}},"result":{"content":"forbidden-mcp-result"}}}
+{"timestamp":"2026-01-02T11:00:12Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>forbidden-injected-plugins</recommended_plugins>\n\nAlso check the amber scheduler."}]}}
+{"timestamp":"2026-01-02T11:00:13Z","type":"compacted","payload":{"message":"","replacement_history":[{"type":"message","role":"developer","content":[{"type":"input_text","text":"forbidden-compaction-replacement"}]}]}}
+{"timestamp":"2026-01-02T11:00:14Z","type":"event_msg","payload":{"type":"context_compacted"}}

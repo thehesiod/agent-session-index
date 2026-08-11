@@ -1,5 +1,50 @@
 # Changelog
 
+## 0.4.0
+
+- Rename the package and user-facing product to Agent Session Index.
+- Add a source adapter boundary and local Codex rollout support.
+- Index Codex rollouts that `codex` archived into `archived_sessions/`, discovered as
+  a sibling of whichever Codex root is in effect.
+- Refresh `file_path` when a transcript moves. The unchanged-check compared only the
+  content hash, so a relocated transcript — an archived Codex rollout, a renamed
+  Claude project directory — kept a row pointing at a path that no longer existed,
+  and `sessions context` could not read it back.
+- Fall back to the indexed text in `sessions context` when the transcript itself is
+  gone, instead of printing a read error and no exchanges. Retention sweeps delete
+  transcripts while the row and its searchable content remain.
+- Migrate existing Claude-only databases to source-qualified identities.
+- Add source labels and filters to search, context, recent, find, analytics,
+  tools, topics, stats, and indexing commands.
+- Exclude developer/system instructions, reasoning records, tool outputs, and
+  large encoded payloads from FTS.
+- Exclude the context Codex injects into user-role records — delegation payloads,
+  skill bodies, plugin catalogs, and `AGENTS.md` repository configuration. These
+  passed the sanitizer and were both searchable and picked as session titles, so
+  sessions were named `<recommended_plugins>` rather than by their prompt.
+- Keep a Codex rollout's own identity. A subagent rollout replays its parent's
+  `session_meta`, and every such record overwrote the session id, cwd, start time,
+  and metadata — so children adopted the parent's id and collided onto one row,
+  silently dropping sessions. Only the first metadata record is now read.
+- Count an MCP invocation once. A single call emits both a `function_call` and an
+  `mcp_tool_call_end`, and each incremented the tool tally separately.
+- Index a Codex rollout whose turns exist only as `user_message`/`agent_message`
+  events, as review and exec subagent rollouts do. They previously produced no
+  title, no exchanges, and no searchable text at all.
+- Leave a migrated v1 database uninitialized so its first run reparses it. The
+  migration copies FTS built by the old rules, which indexed system-like prompts
+  and omitted assistant text, and marking Claude initialized froze that in place.
+- Restore the project and tool breakdowns in `sessions stats`, dropped in the
+  source-aware rewrite while `get_stats()` still computed them.
+- Fall back to literal matching when a `sessions context` query is not a valid
+  regex, rather than silently returning unfiltered text.
+- Derive Codex compaction from `compacted` records and `context_compacted` events.
+  `turn_context.summary` is a setting whose value is `auto` or `none`, so reading it
+  as a summary marked uncompacted sessions as compacted and stored the setting as
+  the session topic.
+- Keep all indexing and synthesis workflows local; transcript uploads are
+  disabled.
+
 ## v0.3.1 — Stop titling everything "## Curation Data"
 
 - **Smarter title auto-generation** — skips markdown headers, agent system prompts, and system caveats when picking a title from user messages. Tries up to 5 messages before giving up.

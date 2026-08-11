@@ -1,3 +1,3 @@
-"""Claude session index — search, analyze, and synthesize across Claude Code sessions."""
+"""Agent Session Index — local search across Claude Code and Codex sessions."""
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
