@@ -879,6 +879,7 @@ class CodexSourceAdapter(SessionSourceAdapter):
         exchange_count = 0
         saw_compaction = False
         saw_session_meta = False
+        parent_session_id = agent_name = thread_name = None
         metadata: dict = {"format": "codex-rollout"}
         event_messages: list[tuple[str, str]] = []
         # total_token_usage is cumulative per rollout, so keep the largest record
@@ -906,9 +907,18 @@ class CodexSourceAdapter(SessionSourceAdapter):
                 session_id = payload.get("id") or session_id
                 cwd = payload.get("cwd") or cwd
                 start_time = payload.get("timestamp") or start_time
+                parent_session_id = sanitize_text(
+                    payload.get("parent_thread_id")
+                    or payload.get("forked_from_id") or "", 200
+                ) or None
+                agent_name = sanitize_text(
+                    payload.get("agent_role")
+                    or payload.get("agent_nickname") or "", 200
+                ) or None
                 for key in (
                     "originator", "model_provider", "git", "thread_source",
-                    "parent_thread_id", "source",
+                    "parent_thread_id", "forked_from_id", "agent_nickname",
+                    "agent_role", "agent_path", "source",
                 ):
                     if payload.get(key) is not None:
                         metadata[key] = payload[key]
@@ -975,6 +985,13 @@ class CodexSourceAdapter(SessionSourceAdapter):
                 and payload.get("type") == "context_compacted"
             ):
                 saw_compaction = True
+            elif (
+                entry_type == "event_msg"
+                and payload.get("type") == "thread_name_updated"
+            ):
+                thread_name = sanitize_text(
+                    payload.get("thread_name", ""), 500
+                ) or thread_name
             elif (
                 entry_type == "event_msg"
                 and payload.get("type") in ("user_message", "agent_message")
@@ -1045,6 +1062,11 @@ class CodexSourceAdapter(SessionSourceAdapter):
         project = cwd or path.parent.name
         project_name = Path(cwd).name if cwd else path.parent.name
         title = _pick_title(user_prompts)
+        if thread_name:
+            title = thread_name
+        elif not title and agent_name:
+            # a delegated rollout is often all injected context, so name it by its agent
+            title = f"{agent_name} subagent"
         topics = [{
             "topic": summary.splitlines()[0][:120],
             "source": "compaction_summary",
@@ -1061,6 +1083,8 @@ class CodexSourceAdapter(SessionSourceAdapter):
             "title": title,
             "title_display": title,
             "tags": None,
+            "parent_session_id": parent_session_id,
+            "agent_name": agent_name,
             "client": _detect_client(self.clients, user_prompts, project_name),
             "file_path": str(path),
             "file_size": path.stat().st_size,

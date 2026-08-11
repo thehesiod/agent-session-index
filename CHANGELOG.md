@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Link a delegated or forked Codex rollout to the session it came from.
+  `session_meta` carries `parent_thread_id` and `forked_from_id`, and neither
+  reached `parent_session_id`, so `--subagents only --source codex` matched
+  nothing and `--subagents exclude` counted every delegated rollout as a
+  top-level session. 247 of 639 local rollouts now resolve a parent, and every
+  parent they name is itself indexed.
+- Resolve a Codex rollout's agent from `agent_role`/`agent_nickname`, matching
+  what the Claude adapter records from a `Task` call, and fall back to naming a
+  delegated rollout after its agent when it has no prose of its own.
+- Read `thread_name_updated` as the session's name. It is Codex's equivalent of
+  Claude's `custom-title`, and a renamed thread previously kept a title picked
+  from its first prompt.
+
 ## 0.5.0
 
 - Index a digest of tool activity, not just prose. Every tool call contributes its

@@ -149,6 +149,45 @@ class AdapterTests(unittest.TestCase):
             "linear.get_issue": 1,
         })
 
+    def test_codex_adapter_links_delegated_rollouts_to_their_parent(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "sessions"
+            root.mkdir()
+            (root / "delegated.jsonl").write_text(json.dumps({
+                "timestamp": "2026-01-02T11:00:00Z", "type": "session_meta",
+                "payload": {"id": "child-1", "cwd": "/Users/test/demo",
+                            "parent_thread_id": "parent-1",
+                            "agent_role": "explorer",
+                            "agent_nickname": "Hubble"},
+            }) + "\n")
+            (root / "forked.jsonl").write_text(json.dumps({
+                "timestamp": "2026-01-02T11:00:00Z", "type": "session_meta",
+                "payload": {"id": "child-2", "cwd": "/Users/test/demo",
+                            "forked_from_id": "parent-2"},
+            }) + "\n")
+            (root / "named.jsonl").write_text("\n".join(json.dumps(r) for r in [
+                {"timestamp": "2026-01-02T11:00:00Z", "type": "session_meta",
+                 "payload": {"id": "named-1", "cwd": "/Users/test/demo"}},
+                {"timestamp": "2026-01-02T11:00:01Z", "type": "event_msg",
+                 "payload": {"type": "thread_name_updated", "thread_id": "named-1",
+                             "thread_name": "Find the Sequin branch"}},
+            ]) + "\n")
+
+            delegated = CodexSourceAdapter(root).parse(root / "delegated.jsonl")
+            forked = CodexSourceAdapter(root).parse(root / "forked.jsonl")
+            named = CodexSourceAdapter(root).parse(root / "named.jsonl")
+
+        # --subagents filters on parent_session_id, which codex never populated
+        self.assertEqual(delegated["parent_session_id"], "parent-1")
+        self.assertEqual(delegated["agent_name"], "explorer")
+        self.assertEqual(delegated["title"], "explorer subagent")
+        # a fork records its origin under a different key
+        self.assertEqual(forked["parent_session_id"], "parent-2")
+        self.assertIsNone(forked["agent_name"])
+        # a renamed thread is codex's equivalent of a custom title
+        self.assertEqual(named["title"], "Find the Sequin branch")
+        self.assertIsNone(named["parent_session_id"])
+
     def test_codex_injected_block_survives_no_closing_tag(self):
         oversized = "plugin name " * (MAX_MESSAGE_CHARS // 6)
         text = sanitize_text(
