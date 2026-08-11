@@ -99,8 +99,9 @@ def run_embed(db_path: Path, rebuild: bool = False, limit: int | None = None,
             "NOT EXISTS (SELECT 1 FROM session_chunks k "
             "WHERE k.source = s.source AND k.session_id = s.session_id)"
         )
+    # keys only: a session's content can reach MAX_FTS_CHARS, so load one at a time
     statement = (
-        "SELECT s.source, s.session_id, s.prose_chars, c.content "
+        "SELECT s.source, s.session_id, s.prose_chars "
         "FROM sessions s JOIN session_content c "
         "ON c.source = s.source AND c.session_id = s.session_id "
         "WHERE " + " AND ".join(conditions) + " ORDER BY s.start_time DESC"
@@ -108,20 +109,25 @@ def run_embed(db_path: Path, rebuild: bool = False, limit: int | None = None,
     if limit:
         statement += " LIMIT ?"
         params.append(limit)
-    rows = conn.execute(statement, params).fetchall()
+    keys = conn.execute(statement, params).fetchall()
     total_chunks = 0
-    for done, row in enumerate(rows, start=1):
+    for done, key in enumerate(keys, start=1):
+        row = conn.execute(
+            "SELECT content FROM session_content "
+            "WHERE source = ? AND session_id = ?",
+            (key["source"], key["session_id"]),
+        ).fetchone()
+        content = (row["content"] if row else "") or ""
         total_chunks += index.index_session(
-            row["source"], row["session_id"],
-            (row["content"] or "")[:row["prose_chars"]],
+            key["source"], key["session_id"], content[:key["prose_chars"]],
         )
         if done % 50 == 0:
             conn.commit()
-            print(f"  {done}/{len(rows)} sessions, {total_chunks} chunks")
+            print(f"  {done}/{len(keys)} sessions, {total_chunks} chunks")
     conn.commit()
     stats = index.stats()
     print(
-        f"Embedded {len(rows)} sessions ({total_chunks} chunks). "
+        f"Embedded {len(keys)} sessions ({total_chunks} chunks). "
         f"Index now holds {stats['chunks']} chunks "
         f"across {stats['sessions']} sessions."
     )
