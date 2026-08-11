@@ -96,61 +96,44 @@ class SessionIndexer:
             self._migrate_v1()
         else:
             self._create_v2_tables()
-            # Support databases created by early multi-source development
-            # snapshots without requiring a destructive rebuild.
-            columns = self._columns("sessions")
-            if "cwd" not in columns:
-                self.conn.execute("ALTER TABLE sessions ADD COLUMN cwd TEXT")
-            if "metadata_json" not in columns:
-                self.conn.execute(
-                    "ALTER TABLE sessions ADD COLUMN metadata_json TEXT"
-                )
-            if "parent_session_id" not in columns:
-                self.conn.execute(
-                    "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT"
-                )
-            if "agent_name" not in columns:
-                self.conn.execute(
-                    "ALTER TABLE sessions ADD COLUMN agent_name TEXT"
-                )
-            if "prose_chars" not in columns:
-                self.conn.execute(
-                    "ALTER TABLE sessions ADD COLUMN prose_chars INTEGER DEFAULT 0"
-                )
-            if "content_chars" not in columns:
-                self.conn.execute(
-                    "ALTER TABLE sessions ADD COLUMN content_chars INTEGER DEFAULT 0"
-                )
-            if "cache_write_5m_tokens" not in self._columns("session_usage"):
-                self.conn.execute(
-                    "ALTER TABLE session_usage "
-                    "ADD COLUMN cache_write_5m_tokens INTEGER DEFAULT 0"
-                )
-            tool_columns = self._columns("session_tools")
-            if "write_tokens" not in tool_columns:
-                self.conn.execute(
-                    "ALTER TABLE session_tools "
-                    "ADD COLUMN write_tokens INTEGER DEFAULT 0"
-                )
-            if "inject_tokens" not in tool_columns:
-                self.conn.execute(
-                    "ALTER TABLE session_tools "
-                    "ADD COLUMN inject_tokens INTEGER DEFAULT 0"
-                )
-            if "result_bytes" not in tool_columns:
-                self.conn.execute(
-                    "ALTER TABLE session_tools "
-                    "ADD COLUMN result_bytes INTEGER DEFAULT 0"
-                )
-            self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
-            self.conn.commit()
-        # After both paths: the column may have just been added above
+        # both paths: _migrate_v1 rebuilds sessions from the v1 column list, so
+        # it lands here missing every column added after v2
+        self._add_missing_columns()
+        self.conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self.conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_sessions_parent "
             "ON sessions(source, parent_session_id)"
         )
         self._sweep_orphans()
         self.conn.commit()
+
+    def _add_missing_columns(self):
+        """Add columns introduced after schema v2 to an existing database."""
+        columns = self._columns("sessions")
+        for name, definition in (
+            ("cwd", "TEXT"),
+            ("metadata_json", "TEXT"),
+            ("parent_session_id", "TEXT"),
+            ("agent_name", "TEXT"),
+            ("prose_chars", "INTEGER DEFAULT 0"),
+            ("content_chars", "INTEGER DEFAULT 0"),
+        ):
+            if name not in columns:
+                self.conn.execute(
+                    f"ALTER TABLE sessions ADD COLUMN {name} {definition}"
+                )
+        if "cache_write_5m_tokens" not in self._columns("session_usage"):
+            self.conn.execute(
+                "ALTER TABLE session_usage "
+                "ADD COLUMN cache_write_5m_tokens INTEGER DEFAULT 0"
+            )
+        tool_columns = self._columns("session_tools")
+        for name in ("write_tokens", "inject_tokens", "result_bytes"):
+            if name not in tool_columns:
+                self.conn.execute(
+                    f"ALTER TABLE session_tools "
+                    f"ADD COLUMN {name} INTEGER DEFAULT 0"
+                )
 
     def _sweep_orphans(self):
         """Drop derived rows whose session row is gone.
@@ -471,14 +454,47 @@ class SessionIndexer:
     def _embed_session(self, identity: tuple[str, str], data: dict):
         index = self._semantic_index()
         if index is None:
+            # the prose changed but its vectors did not, so drop them rather
+            # than let hybrid search keep matching the previous content
+            self._drop_stale_vectors(identity)
             return
         # Only the prose half is embedded; the tool digest is lexical territory
         prose = (data.get("fts_content") or "")[:data.get("prose_chars") or 0]
         try:
             index.index_session(*identity, prose)
         except (sqlite3.Error, semantic.SemanticUnavailable) as exc:
+            self._drop_stale_vectors(identity)
             print(
                 f"Embedding failed for {identity[0]}:{identity[1]}: {exc}",
+                file=sys.stderr,
+            )
+
+    def _drop_stale_vectors(self, identity: tuple[str, str]):
+        """Remove chunks for a session whose prose was re-indexed without embedding."""
+        if not self._table_exists("session_chunks"):
+            return
+        try:
+            rows = self.conn.execute(
+                "SELECT chunk_id FROM session_chunks "
+                "WHERE source = ? AND session_id = ?",
+                identity,
+            ).fetchall()
+            if not rows:
+                return
+            if self._table_exists("session_vectors"):
+                for row in rows:
+                    self.conn.execute(
+                        "DELETE FROM session_vectors WHERE chunk_id = ?",
+                        (row[0],),
+                    )
+            self.conn.execute(
+                "DELETE FROM session_chunks WHERE source = ? AND session_id = ?",
+                identity,
+            )
+        except sqlite3.Error as exc:
+            print(
+                f"Could not clear stale vectors for "
+                f"{identity[0]}:{identity[1]}: {exc}",
                 file=sys.stderr,
             )
 

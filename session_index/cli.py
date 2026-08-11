@@ -398,6 +398,8 @@ def main():
         if args.db_path else config.get_db_path()
     )
     if args.command == "embed":
+        # embed reads columns a pre-v3 database lacks, so migrate first
+        config.ensure_indexed(db_path)
         run_embed(db_path, rebuild=args.rebuild, limit=args.limit,
                   source=args.source)
         return

@@ -21,6 +21,8 @@ SNIPPET_MAX_DOC_CHARS = 200_000
 SNIPPET_SCAN_CHARS = 2_000_000
 EXCERPT_RADIUS = 60
 VALID_SOURCES = ("claude", "codex")
+# columns added after schema v2 that this module selects
+REQUIRED_COLUMNS = frozenset({"parent_session_id", "content_chars", "prose_chars"})
 SUBAGENT_MODES = ("include", "exclude", "only")
 USAGE_GROUPINGS = {
     "model": "u.model",
@@ -135,7 +137,13 @@ class SessionSearch:
             row["name"]
             for row in self.conn.execute("PRAGMA table_info(sessions)")
         }
-        if columns and "source" not in columns:
+        # a v2 database predates the columns the queries below select, so it
+        # needs the indexer's additive migration just as a v1 one does
+        needs_migration = columns and (
+            "source" not in columns
+            or not REQUIRED_COLUMNS.issubset(columns)
+        )
+        if needs_migration:
             self.conn.close()
             try:
                 from .indexer import SessionIndexer

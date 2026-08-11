@@ -55,6 +55,33 @@ class AdapterTests(unittest.TestCase):
         self.assertIn("cobalt-needle", data["fts_content"])
         self.assertNotIn("forbidden-claude-system", data["fts_content"])
 
+    def test_claude_split_response_is_billed_once(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            (root / "-proj").mkdir(parents=True)
+            usage = {"input_tokens": 100, "output_tokens": 20,
+                     "cache_read_input_tokens": 5}
+            # one API response arrives as several rows repeating id and usage
+            rows = [
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:00Z",
+                 "message": {"id": "msg_1", "role": "assistant",
+                             "model": "claude-test", "usage": usage,
+                             "content": [{"type": "text", "text": "part one"}]}},
+                {"type": "assistant", "timestamp": "2026-01-01T00:00:01Z",
+                 "message": {"id": "msg_1", "role": "assistant",
+                             "model": "claude-test", "usage": usage,
+                             "content": [{"type": "text", "text": "part two"}]}},
+            ]
+            path = root / "-proj" / "split.jsonl"
+            path.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+
+            data = ClaudeSourceAdapter(root).parse(path)
+
+        bucket = data["usage"]["claude-test"]
+        self.assertEqual(bucket["calls"], 1)
+        self.assertEqual(bucket["input_tokens"], 100)
+        self.assertEqual(bucket["output_tokens"], 20)
+
     def test_codex_adapter_normalizes_safe_rollout_records(self):
         path = next(CodexSourceAdapter(CODEX_ROOT).discover())
         data = CodexSourceAdapter(CODEX_ROOT).parse(path)
@@ -600,6 +627,55 @@ class MigrationTests(unittest.TestCase):
 
         # nothing was migrated, so the first run must still backfill claude
         self.assertEqual(initialized, set())
+
+    def test_v1_upgrade_gains_columns_added_after_v2(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            db_path = Path(tempdir) / "legacy-columns.db"
+            conn = sqlite3.connect(db_path)
+            conn.executescript("""
+                CREATE TABLE sessions (
+                    session_id TEXT PRIMARY KEY,
+                    project TEXT, project_name TEXT, title TEXT,
+                    title_display TEXT, tags TEXT, client TEXT,
+                    file_path TEXT NOT NULL, file_size INTEGER,
+                    exchange_count INTEGER DEFAULT 0, start_time TEXT,
+                    end_time TEXT, duration_minutes INTEGER, model TEXT,
+                    has_compaction INTEGER DEFAULT 0,
+                    indexed_at TEXT NOT NULL, last_modified TEXT,
+                    file_hash TEXT
+                );
+                CREATE VIRTUAL TABLE session_content USING fts5(
+                    session_id, content
+                );
+            """)
+            conn.execute("""
+                INSERT INTO sessions (
+                    session_id, project, project_name, file_path, indexed_at
+                ) VALUES ('legacy-id', 'legacy', 'Legacy', '/tmp/legacy.jsonl',
+                          '2026-01-01T00:00:00')
+            """)
+            conn.commit()
+            conn.close()
+
+            indexer = SessionIndexer(
+                db_path=db_path, source_configs=source_configs()
+            )
+            indexer.connect()
+            try:
+                columns = {
+                    row["name"] for row in
+                    indexer.conn.execute("PRAGMA table_info(sessions)")
+                }
+                stats = indexer.backfill_all(progress_interval=0)
+            finally:
+                indexer.close()
+
+        # a migrated v1 database rebuilds sessions and must not lose later columns
+        self.assertIn("prose_chars", columns)
+        self.assertIn("content_chars", columns)
+        self.assertIn("parent_session_id", columns)
+        self.assertEqual(stats["errors"], 0)
+        self.assertEqual(stats["indexed"], 2)
 
 
 class ConfigTests(unittest.TestCase):

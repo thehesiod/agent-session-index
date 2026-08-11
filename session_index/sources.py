@@ -681,6 +681,7 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
         title = title_display = tags = None
         parent_session_id = agent_name = None
         usage: dict[str, dict[str, int]] = {}
+        billed_messages: set[str] = set()
         tool_tokens = _ToolTokens()
 
         for entry in _read_jsonl(path):
@@ -727,10 +728,15 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
                 )
                 if entry_type == "assistant":
                     model = model or message.get("model")
-                    _add_claude_usage(
-                        usage, message.get("model"), message.get("usage")
-                    )
-                    tool_tokens.assistant(message)
+                    # split rows repeat one response's id and usage; bill it once
+                    message_id = message.get("id")
+                    if message_id is None or message_id not in billed_messages:
+                        if message_id is not None:
+                            billed_messages.add(message_id)
+                        _add_claude_usage(
+                            usage, message.get("model"), message.get("usage")
+                        )
+                        tool_tokens.assistant(message)
                 else:
                     tool_tokens.result(message)
                     if text and not _looks_like_system_prompt(text):

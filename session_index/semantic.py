@@ -93,12 +93,13 @@ def _load_model():
     previous = os.environ.get(HF_OFFLINE_VAR)
     os.environ[HF_OFFLINE_VAR] = "1"
     try:
-        _model = StaticModel.from_pretrained(name)
+        # from_pretrained defaults force_download=True, refetching a cached model
+        _model = StaticModel.from_pretrained(name, force_download=False)
     except Exception:
         # Not cached yet, so allow exactly one download
         _restore_env(HF_OFFLINE_VAR, previous)
         try:
-            _model = StaticModel.from_pretrained(name)
+            _model = StaticModel.from_pretrained(name, force_download=False)
         except Exception as exc:
             _model_error = f"could not load {name}: {exc}"
             raise SemanticUnavailable(_model_error) from exc
