@@ -109,6 +109,19 @@ class SessionIndexer:
         self._sweep_orphans()
         self.conn.commit()
 
+    def _backfill_content_rowid(self):
+        """Map existing sessions onto their session_content row, one scan not one per session."""
+        pairs = [
+            (row[0], row[1], row[2])
+            for row in self.conn.execute(
+                "SELECT rowid, source, session_id FROM session_content"
+            )
+        ]
+        self.conn.executemany(
+            "UPDATE sessions SET content_rowid=? WHERE source=? AND session_id=?",
+            pairs,
+        )
+
     def _add_missing_columns(self):
         """Add columns introduced after schema v2 to an existing database."""
         columns = self._columns("sessions")
@@ -120,11 +133,14 @@ class SessionIndexer:
             ("prose_chars", "INTEGER DEFAULT 0"),
             ("content_chars", "INTEGER DEFAULT 0"),
             ("extraction_version", "INTEGER DEFAULT 0"),
+            ("content_rowid", "INTEGER"),
         ):
             if name not in columns:
                 self.conn.execute(
                     f"ALTER TABLE sessions ADD COLUMN {name} {definition}"
                 )
+                if name == "content_rowid":
+                    self._backfill_content_rowid()
         if "cache_write_5m_tokens" not in self._columns("session_usage"):
             self.conn.execute(
                 "ALTER TABLE session_usage "
@@ -624,15 +640,27 @@ class SessionIndexer:
                     ) VALUES (?, ?, ?, ?)
                 """, (*identity, agent, count))
 
-            self.conn.execute(
-                "DELETE FROM session_content WHERE source=? AND session_id=?",
+            # source/session_id are UNINDEXED on this fts5 table, so filtering on them scans every row
+            prior = self.conn.execute(
+                "SELECT content_rowid FROM sessions WHERE source=? AND session_id=?",
                 identity,
-            )
+            ).fetchone()
+            old_rowid = prior["content_rowid"] if prior else None
+            if old_rowid is not None:
+                self.conn.execute(
+                    "DELETE FROM session_content WHERE rowid=?", (old_rowid,)
+                )
+            new_rowid = None
             if data["fts_content"]:
-                self.conn.execute("""
+                new_rowid = self.conn.execute("""
                     INSERT INTO session_content (source, session_id, content)
                     VALUES (?, ?, ?)
-                """, (*identity, data["fts_content"]))
+                """, (*identity, data["fts_content"])).lastrowid
+            if new_rowid != old_rowid:
+                self.conn.execute(
+                    "UPDATE sessions SET content_rowid=? WHERE source=? AND session_id=?",
+                    (new_rowid, *identity),
+                )
             self._embed_session(identity, data)
 
             for topic in data["topics"]:
