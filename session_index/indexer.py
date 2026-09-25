@@ -390,8 +390,13 @@ class SessionIndexer:
         if not adapter:
             return None
         data = adapter.parse(session_path)
-        if data:
+        if not data:
+            return data
+        try:
             data["file_hash"] = self._file_hash(session_path)
+        except OSError as exc:
+            print(f"Error reading {session_path}: {exc}", file=sys.stderr)
+            return None
         return data
 
     def _iter_session_files(self, source: str | None = None):
@@ -715,7 +720,14 @@ class SessionIndexer:
                     f"({stats['indexed']} indexed, {stats['errors']} errors)"
                 )
 
-            current_hash = self._file_hash(path)
+            try:
+                current_hash = self._file_hash(path)
+            except OSError as exc:
+                # dangling symlink, or the file vanished after discovery
+                print(f"Error reading {path}: {exc}", file=sys.stderr)
+                stats["errors"] += 1
+                source_stats["errors"] += 1
+                continue
             parsed = None
             # A filename-derived id may be wrong; the skip below still checks path + hash.
             session_id = self.adapters[name].session_id_from_path(path)
