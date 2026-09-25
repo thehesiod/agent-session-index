@@ -693,6 +693,8 @@ class ClaudeSourceAdapter(SessionSourceAdapter):
             # subagents/ nests at varying depths; pathlib.glob ignores symlinks
             for pattern in ("*.jsonl", "**/subagents/**/*.jsonl")
             for path in project_dir.glob(pattern)
+            # workflow resume ledgers: every one takes the stem id "journal" and collides onto one row
+            if path.name != "journal.jsonl"
         )
 
     def session_id_from_path(self, path: Path) -> Optional[str]:

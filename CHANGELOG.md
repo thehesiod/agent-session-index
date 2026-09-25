@@ -53,6 +53,11 @@ back into the version sections that predate them.
 - Resolve an archived Codex rollout back to its source. Adapters expose `roots()`
   and `owns()`, so `sessions index --file` no longer fails with "Cannot determine
   session source" on a rollout that `discover()` finds.
+- Keep indexing past a transcript that cannot be read. Claude Code stores some
+  subagent transcripts as absolute symlinks into another session, and one whose
+  target is gone raised `FileNotFoundError` and aborted the whole run, leaving
+  every later file unindexed. A dangling link, or a file removed mid-run, now
+  logs one line and counts toward the run's `errors`.
 
 ### Upgrades and the vector layer
 

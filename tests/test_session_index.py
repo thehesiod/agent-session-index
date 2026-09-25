@@ -4,7 +4,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -408,6 +408,79 @@ class IncrementalReparseTests(unittest.TestCase):
 
         self.assertEqual(stats["unchanged"], 1)
         self.assertEqual(stats["indexed"], 0)
+
+    def _claude_only_indexer(self, tempdir: str, root: Path) -> SessionIndexer:
+        indexer = SessionIndexer(
+            db_path=Path(tempdir) / "sessions.db",
+            source_configs={
+                "claude": {"enabled": True, "root": str(root)},
+                "codex": {"enabled": False},
+            },
+        )
+        indexer.connect()
+        return indexer
+
+    def test_dangling_subagent_symlink_is_a_per_file_error(self):
+        source = CLAUDE_ROOT / "-Users-test-demo" / "shared-session.jsonl"
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            project = root / "-demo-project"
+            subagents = project / "shared-session" / "subagents"
+            subagents.mkdir(parents=True)
+            (project / "shared-session.jsonl").write_text(source.read_text())
+            dangling = subagents / "agent-gone.jsonl"
+            dangling.symlink_to(
+                Path(tempdir) / "other-session" / "subagents" / "agent-gone.jsonl"
+            )
+
+            indexer = self._claude_only_indexer(tempdir, root)
+            stderr = io.StringIO()
+            try:
+                with redirect_stderr(stderr):
+                    stats = indexer.index_incremental()
+                indexed = [
+                    row["session_id"]
+                    for row in indexer.conn.execute("SELECT session_id FROM sessions")
+                ]
+            finally:
+                indexer.close()
+
+        self.assertEqual(stats["indexed"], 1)
+        self.assertEqual(stats["errors"], 1)
+        self.assertEqual(indexed, ["shared-session"])
+        logged = [line for line in stderr.getvalue().splitlines() if str(dangling) in line]
+        self.assertEqual(len(logged), 1)
+
+    def test_transcript_removed_mid_parse_is_a_per_file_error(self):
+        source = CLAUDE_ROOT / "-Users-test-demo" / "shared-session.jsonl"
+        parse = ClaudeSourceAdapter.parse
+
+        def parse_then_remove(adapter, path):
+            data = parse(adapter, path)
+            path.unlink()
+            return data
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = Path(tempdir) / "projects"
+            (root / "-demo-project").mkdir(parents=True)
+            (root / "-demo-project" / "shared-session.jsonl").write_text(
+                source.read_text()
+            )
+
+            indexer = self._claude_only_indexer(tempdir, root)
+            try:
+                with patch.object(
+                    ClaudeSourceAdapter, "parse", autospec=True,
+                    side_effect=parse_then_remove,
+                ), redirect_stderr(io.StringIO()):
+                    stats = indexer.index_incremental()
+                count = indexer.conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            finally:
+                indexer.close()
+
+        self.assertEqual(stats["indexed"], 0)
+        self.assertEqual(stats["errors"], 1)
+        self.assertEqual(count, 0)
 
 
 class IndexIntegrationTests(unittest.TestCase):
