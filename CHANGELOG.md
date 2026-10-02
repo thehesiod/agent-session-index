@@ -84,6 +84,11 @@ back into the version sections that predate them.
   source-aware rewrite while `get_stats()` still computed them.
 - Fall back to literal matching when a `sessions context` query is not a valid
   regex, rather than silently returning unfiltered text.
+- Add `sessions pr <number>`, listing the sessions that worked on a pull request.
+  Title matches rank first, then `gh pr` commands, `pull/N` URLs, review
+  invocations and `--pr N`, then `PR #N` references, then bare mentions; newest
+  first within a tier. A subagent hit resolves to its resumable parent, and a
+  number inside a longer number, decimal or UUID is not a match.
 
 ### Cross-source parity
 

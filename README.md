@@ -68,6 +68,10 @@ sessions find --tool shell_command --source codex
 sessions find --project myapp --week --source claude
 sessions topics <id> --source claude
 
+# Sessions that worked on a pull request, strongest evidence first
+sessions pr 1234
+sessions pr 1234 --source codex -n 5
+
 # Analytics, tools, and database statistics
 sessions analytics --week --source codex
 sessions tools --source codex

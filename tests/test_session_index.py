@@ -1046,6 +1046,113 @@ class SubagentTests(unittest.TestCase):
                 self.assertEqual(result["only"], {"agent-abc123"})
 
 
+class PrLookupTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        root = Path(self.tempdir.name) / "projects"
+        project = root / "-demo-project"
+        subagents = project / "parent-session" / "subagents"
+        subagents.mkdir(parents=True)
+        transcripts = (
+            (project / "title-session.jsonl", "Review PR 1234", "ok", "01"),
+            (project / "command-session.jsonl", "status",
+             "running /code-review 1234 now", "02"),
+            (project / "mention-session.jsonl", "status",
+             "unrelated, though #1234 came up", "03"),
+            (project / "parent-session.jsonl", "status", "build is flaky", "04"),
+            (subagents / "agent-abc123.jsonl", "status",
+             "ran gh pr diff 1234 --name-only", "04"),
+            (project / "noise-session.jsonl", "status",
+             "id ff1a6550-1234-43aa took 3.1234 seconds, 1234.5 rows, "
+             "12345 total", "05"),
+        )
+        for path, prompt, reply, day in transcripts:
+            records = [
+                {"type": "user",
+                 "message": {"role": "user", "content": prompt},
+                 "timestamp": f"2026-01-{day}T00:00:00Z"},
+                {"type": "assistant",
+                 "message": {"role": "assistant", "content": [
+                     {"type": "text", "text": reply},
+                 ]},
+                 "timestamp": f"2026-01-{day}T00:01:00Z"},
+            ]
+            for record in records:
+                if "subagents" in path.parts:
+                    record["isSidechain"] = True
+                    record["sessionId"] = "parent-session"
+            path.write_text("".join(json.dumps(r) + "\n" for r in records))
+        self.db_path = Path(self.tempdir.name) / "sessions.db"
+        indexer = SessionIndexer(
+            db_path=self.db_path,
+            source_configs={
+                "claude": {"enabled": True, "root": str(root)},
+                # enabled so the CLI finds every source initialized and skips indexing
+                "codex": {"enabled": True, "root": str(CODEX_ROOT)},
+            },
+        )
+        indexer.connect()
+        try:
+            indexer.backfill_all(progress_interval=0)
+        finally:
+            indexer.close()
+
+    def tearDown(self):
+        self.tempdir.cleanup()
+
+    def pr_sessions(self, number):
+        search = SessionSearch(db_path=self.db_path)
+        search.connect()
+        try:
+            return search.pr_sessions(number)
+        finally:
+            search.close()
+
+    def test_strong_signals_rank_first_and_newest_wins_ties(self):
+        results = self.pr_sessions(1234)
+        self.assertEqual(
+            [row["session_id"] for row in results],
+            ["title-session", "parent-session", "command-session",
+             "mention-session"],
+        )
+        self.assertEqual(
+            [row["pr_tier"] for row in results], [4, 3, 3, 2]
+        )
+
+    def test_number_inside_uuid_decimal_or_longer_number_is_ignored(self):
+        self.assertNotIn(
+            "noise-session",
+            {row["session_id"] for row in self.pr_sessions(1234)},
+        )
+        self.assertEqual(self.pr_sessions(123), [])
+
+    def test_subagent_hit_resolves_to_its_parent(self):
+        parent = next(
+            row for row in self.pr_sessions(1234)
+            if row["session_id"] == "parent-session"
+        )
+        self.assertEqual(parent["via_subagent"], "agent-abc123")
+        rendered = format_result(parent)
+        self.assertIn("via subagent abc123", rendered)
+        self.assertIn("claude --resume parent-session", rendered)
+
+    def test_cli_prints_local_dates_and_resume_commands(self):
+        stdout = io.StringIO()
+        argv = ["sessions", "--db-path", str(self.db_path), "pr", "1234"]
+        with patch("sys.argv", argv), redirect_stdout(stdout):
+            cli.main()
+        output = stdout.getvalue()
+        self.assertIn("4 sessions for PR 1234", output)
+        self.assertIn("claude --resume title-session", output)
+        self.assertRegex(output, r"\d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+")
+
+        stdout = io.StringIO()
+        argv = ["sessions", "--db-path", str(self.db_path), "pr", "999"]
+        with patch("sys.argv", argv), redirect_stdout(stdout):
+            cli.main()
+        self.assertIn("No sessions mention PR 999.", stdout.getvalue())
+
+
 class UsageTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()

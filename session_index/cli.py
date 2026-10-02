@@ -35,7 +35,7 @@ except ImportError:
 SOURCES = ("claude", "codex")
 SUBCOMMANDS = {
     "context", "analytics", "synthesize", "recent", "find",
-    "tools", "topics", "stats", "index", "search", "usage", "embed",
+    "tools", "topics", "stats", "index", "search", "usage", "embed", "pr",
 }
 
 
@@ -318,6 +318,11 @@ def main():
     _add_source(command)
     _add_subagents(command)
 
+    command = subparsers.add_parser("pr", help="Sessions that worked on a PR")
+    command.add_argument("number", type=int, help="Pull request number")
+    command.add_argument("-n", "--limit", type=int, default=20)
+    _add_source(command)
+
     command = subparsers.add_parser("tools", help="Tool usage")
     command.add_argument("tool_name", nargs="?")
     _add_source(command)
@@ -507,6 +512,17 @@ def main():
                 print("No sessions match those filters.")
                 return
             _print_results(f"📋 {len(results)} sessions", results)
+
+        elif args.command == "pr":
+            results = searcher.pr_sessions(
+                args.number, limit=args.limit, source=args.source
+            )
+            if not results:
+                print(f"No sessions mention PR {args.number}.")
+                return
+            _print_results(
+                f"🔗 {len(results)} sessions for PR {args.number}", results
+            )
 
         elif args.command == "tools":
             results = searcher.tools_usage(

@@ -63,6 +63,10 @@ sessions find --tool shell_command --source codex
 sessions recent 20 --source codex
 ```
 
+For "which session worked on PR N", skip search and run `sessions pr N`. It ranks
+title matches, then `gh pr`/review commands and `pull/N` URLs, then `#N` references,
+then bare mentions, and resolves subagent hits to their resumable parent.
+
 Reach for `--no-recency` when the question is historical ("when did we first hit this"),
 and `--days N` when it is about current state. `--half-life DAYS` tunes the decay.
 

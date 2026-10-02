@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -32,6 +33,52 @@ USAGE_GROUPINGS = {
     "agent": "s.agent_name",
     "day": "substr(s.start_time, 1, 10)",
 }
+
+PR_TIER_LABELS = {4: "title", 3: "command", 2: "reference", 1: "mention"}
+
+
+def _pr_patterns(number: int) -> list[tuple[int, re.Pattern]]:
+    """Tiered patterns for one PR number, strongest first.
+
+    The number must stand alone, so it never matches inside a longer number,
+    a decimal, a UUID segment, or a timestamp.
+    """
+    n = rf"#?{number}(?![\w]|[.:]\d|-[0-9a-f])"
+    flags = re.IGNORECASE
+    return [
+        (3, re.compile(
+            rf"\bgh\s+pr\s+[a-z-]+\b[^\n|;&]{{0,80}}?(?<![\w.-]){n}", flags)),
+        (3, re.compile(rf"\bpulls?/{n}", flags)),
+        (3, re.compile(rf"[/$][\w:.-]*review[\w-]*\s+{n}", flags)),
+        (3, re.compile(rf"--pr[=\s]+{n}", flags)),
+        (3, re.compile(rf"\bpr[/_-]{n}", flags)),
+        (2, re.compile(rf"\b(?:pr|pull\s+request)\s*{n}", flags)),
+        (2, re.compile(rf"(?<![\w&])#{number}(?![\w]|[.:]\d)")),
+        (2, re.compile(rf"\bpr_?number\"?\s*[:=]\s*{n}", flags)),
+        (1, re.compile(rf"(?<![\w.#-]){n}")),
+    ]
+
+
+def _pr_evidence(text: str, patterns: list[tuple[int, re.Pattern]]
+                 ) -> tuple[int, str]:
+    """Strongest tier any pattern reaches in text, with an excerpt of it."""
+    for tier, pattern in patterns:
+        if match := pattern.search(text):
+            start = max(match.start() - EXCERPT_RADIUS // 2, 0)
+            return tier, text[start:match.end() + EXCERPT_RADIUS]
+    return 0, ""
+
+
+def _local_time(start_time: str | None) -> str | None:
+    if not start_time:
+        return None
+    try:
+        started = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if not started.tzinfo:
+        return None
+    return started.astimezone().strftime("%Y-%m-%d %H:%M %Z")
 
 
 def _escape_fts_query(query: str) -> str:
@@ -389,6 +436,68 @@ class SessionSearch:
         """, params).fetchall()
         return [self._with_topics(row) for row in rows]
 
+    def pr_sessions(self, number: int, limit: int = 20,
+                    source: str | None = None) -> list[dict]:
+        """Sessions that worked on one PR, strongest evidence first.
+
+        Subagent hits fold into their parent, which is the resumable session.
+        """
+        source_clause, source_params = self._source_condition(source)
+        candidates = self.conn.execute(
+            "SELECT s.source, s.session_id, s.parent_session_id, "
+            "s.title, s.title_display "
+            "FROM session_content "
+            "JOIN sessions s ON s.source = session_content.source "
+            "AND s.session_id = session_content.session_id "
+            "WHERE session_content MATCH ? AND " + source_clause,
+            [f'"{number}"', *source_params],
+        ).fetchall()
+        patterns = _pr_patterns(number)
+        found: dict[tuple[str, str], dict] = {}
+        for candidate in candidates:
+            title_tier, title_excerpt = _pr_evidence(
+                " ".join(filter(None, (
+                    candidate["title"], candidate["title_display"]
+                ))),
+                patterns,
+            )
+            # keys only above: content can reach MAX_FTS_CHARS per session
+            row = self.conn.execute(
+                "SELECT content FROM session_content "
+                "WHERE source = ? AND session_id = ?",
+                (candidate["source"], candidate["session_id"]),
+            ).fetchone()
+            tier, excerpt = _pr_evidence((row[0] if row else "") or "", patterns)
+            if title_tier:
+                tier, excerpt = 4, title_excerpt
+            if not tier:
+                continue
+            key = (candidate["source"], candidate["session_id"])
+            via = None
+            if parent_id := candidate["parent_session_id"]:
+                if self._hydrate(candidate["source"], parent_id):
+                    via = candidate["session_id"]
+                    key = (candidate["source"], parent_id)
+            current = found.get(key)
+            if current and current["pr_tier"] >= tier:
+                continue
+            result = self._hydrate(*key)
+            result["pr_tier"] = tier
+            result["snippet"] = f"{PR_TIER_LABELS[tier]}: {excerpt}"
+            result["start_display"] = _local_time(result.get("start_time"))
+            if via:
+                result["via_subagent"] = via
+            found[key] = result
+        ordered = sorted(
+            found.values(),
+            key=lambda item: item.get("start_time") or "",
+            reverse=True,
+        )
+        ordered.sort(key=lambda item: (
+            -item["pr_tier"], bool(item.get("parent_session_id")),
+        ))
+        return [self._with_topics_dict(result) for result in ordered[:limit]]
+
     def resolve_session(self, session_id: str,
                         source: str | None = None) -> dict | None:
         if ":" in session_id and not source:
@@ -625,7 +734,9 @@ def format_result(result: dict, show_topics: bool = True) -> str:
     meta = []
     if result.get("agent_name"):
         meta.append(f"agent {result['agent_name']}")
-    if result.get("start_time"):
+    if result.get("start_display"):
+        meta.append(result["start_display"])
+    elif result.get("start_time"):
         meta.append(result["start_time"][:10])
     if result.get("project_name"):
         meta.append(result["project_name"])
@@ -637,6 +748,10 @@ def format_result(result: dict, show_topics: bool = True) -> str:
         meta.append(f"{result['duration_minutes']}min")
     if result.get("has_compaction"):
         meta.append("compacted")
+    if result.get("via_subagent"):
+        meta.append(
+            f"via subagent {result['via_subagent'].removeprefix('agent-')[:8]}"
+        )
     if result.get("superseded_by"):
         meta.append(
             f"superseded by {result['superseded_by'].removeprefix('agent-')[:8]}"
