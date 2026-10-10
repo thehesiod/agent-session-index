@@ -6,6 +6,13 @@ Nothing below has been released; `pyproject` still reads 0.5.0. Bug fixes that
 landed after the 0.5.0 notes were written are collected here rather than edited
 back into the version sections that predate them.
 
+### Commands
+
+- Add `sessions forget <id> [--source]`, which removes a session, its subagent
+  sessions, and their searchable text, chunks, vectors, and child rows in one
+  transaction. The indexer deliberately keeps rows whose transcript is missing,
+  so there was no way to make a deliberately deleted session unsearchable.
+
 ### Indexed content
 
 - Exclude the context Codex injects into user-role records — delegation payloads,

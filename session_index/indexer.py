@@ -24,6 +24,10 @@ SCHEMA_VERSION = 3
 # bump when the adapters change what they extract; the hash-based skip cannot see that
 EXTRACTION_VERSION = 2
 VALID_SOURCES = ("claude", "codex")
+CHILD_TABLES = (
+    "session_tools", "session_tool_detail", "session_usage", "session_agents",
+    "session_topics",
+)
 
 
 class SessionIndexer:
@@ -521,6 +525,84 @@ class SessionIndexer:
                 f"{identity[0]}:{identity[1]}: {exc}",
                 file=sys.stderr,
             )
+
+    def forget_session(self, session_id: str, source: str | None = None
+                       ) -> dict[str, int] | None:
+        """Delete a session, its subagents, and everything derived from them.
+
+        Returns per-table row counts, or None when the session is not indexed.
+        """
+        params = (session_id, source) if source else (session_id,)
+        clause = " AND source = ?" if source else ""
+        found = self.conn.execute(
+            f"SELECT source, session_id FROM sessions WHERE session_id = ?{clause}",
+            params,
+        ).fetchall()
+        if not found:
+            return None
+        identities = {(row["source"], row["session_id"]) for row in found}
+        pending = list(identities)
+        while pending:
+            parent_source, parent_id = pending.pop()
+            for row in self.conn.execute(
+                "SELECT source, session_id FROM sessions "
+                "WHERE source = ? AND parent_session_id = ?",
+                (parent_source, parent_id),
+            ):
+                if (child := (row["source"], row["session_id"])) not in identities:
+                    identities.add(child)
+                    pending.append(child)
+
+        has_vectors = self._table_exists("session_vectors")
+        if has_vectors and not semantic.load_vec_extension(self.conn):
+            raise RuntimeError(
+                "session_vectors exists but sqlite-vec could not be loaded; "
+                "install the semantic extra so its vectors can be deleted"
+            )
+
+        counts = dict.fromkeys(
+            ("sessions", "session_content", "session_chunks", "session_vectors",
+             *CHILD_TABLES), 0,
+        )
+        with self.conn:
+            for identity in sorted(identities):
+                if self._table_exists("session_chunks"):
+                    chunk_ids = [
+                        row[0] for row in self.conn.execute(
+                            "SELECT chunk_id FROM session_chunks "
+                            "WHERE source = ? AND session_id = ?", identity,
+                        )
+                    ]
+                    counts["session_chunks"] += len(chunk_ids)
+                    if has_vectors:
+                        counts["session_vectors"] += len(chunk_ids)
+                    self._drop_stale_vectors(identity)
+                    if self.conn.execute(
+                        "SELECT 1 FROM session_chunks "
+                        "WHERE source = ? AND session_id = ?", identity,
+                    ).fetchone():
+                        raise RuntimeError(
+                            f"could not clear chunks for {identity[0]}:{identity[1]}"
+                        )
+                for table in CHILD_TABLES:
+                    counts[table] += self.conn.execute(
+                        f"DELETE FROM {table} "
+                        "WHERE session_source = ? AND session_id = ?", identity,
+                    ).rowcount
+                row = self.conn.execute(
+                    "SELECT content_rowid FROM sessions "
+                    "WHERE source = ? AND session_id = ?", identity,
+                ).fetchone()
+                if row["content_rowid"] is not None:
+                    counts["session_content"] += self.conn.execute(
+                        "DELETE FROM session_content WHERE rowid = ?",
+                        (row["content_rowid"],),
+                    ).rowcount
+                counts["sessions"] += self.conn.execute(
+                    "DELETE FROM sessions WHERE source = ? AND session_id = ?",
+                    identity,
+                ).rowcount
+        return counts
 
     def _upsert_session(self, data: dict) -> bool:
         try:

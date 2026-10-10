@@ -8,7 +8,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from session_index import cli, config
+from session_index import cli, config, semantic, topic_capture
 from session_index.analyzer import (
     analytics,
     format_context,
@@ -1292,6 +1292,148 @@ class LongSessionTests(unittest.TestCase):
                 connection.close()
 
             self.assertIn("4033", content)
+
+
+class ForgetTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tempdir.name) / "sessions.db"
+        self.indexer = SessionIndexer(
+            db_path=self.db_path, source_configs=source_configs(), embed=False
+        )
+        self.indexer.connect()
+        self.indexer.backfill_all(progress_interval=0)
+        self.conn = self.indexer.conn
+        self.conn.execute(
+            "INSERT INTO sessions (source, session_id, project, project_name,"
+            " file_path, start_time, indexed_at, content_chars, parent_session_id)"
+            " VALUES ('claude', 'child-session', 'p', 'p', '/tmp/x', ?, ?, 1,"
+            " 'shared-session')",
+            ("2026-01-01T00:00:00", "2026-01-01T00:00:00"),
+        )
+        self.conn.execute(
+            "INSERT INTO session_tools (session_source, session_id, tool_name,"
+            " use_count) VALUES ('claude', 'child-session', 'Bash', 1)"
+        )
+        self.conn.execute("""
+            CREATE TABLE session_chunks (
+                chunk_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL, session_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL, char_offset INTEGER NOT NULL,
+                char_length INTEGER NOT NULL
+            )
+        """)
+        for source in ("claude", "codex"):
+            self.conn.execute(
+                "INSERT INTO session_chunks (source, session_id, ordinal,"
+                " char_offset, char_length) VALUES (?, 'shared-session', 0, 0, 5)",
+                (source,),
+            )
+        self.conn.commit()
+
+    def tearDown(self):
+        self.indexer.close()
+        self.tempdir.cleanup()
+
+    def count(self, table, **where):
+        clause = " AND ".join(f"{column} = ?" for column in where) or "1"
+        return self.conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE {clause}", tuple(where.values())
+        ).fetchone()[0]
+
+    def search_hits(self, term, source):
+        search = SessionSearch(self.db_path)
+        search.connect()
+        try:
+            return search.search(term, source=source)
+        finally:
+            search.close()
+
+    def test_forget_removes_session_children_and_content(self):
+        before = self.count("session_content")
+        counts = self.indexer.forget_session("shared-session", "claude")
+
+        self.assertEqual(counts["sessions"], 2)
+        self.assertEqual(counts["session_content"], 1)
+        self.assertEqual(counts["session_chunks"], 1)
+        self.assertGreaterEqual(counts["session_tools"], 1)
+        self.assertEqual(self.count("session_content"), before - 1)
+        self.assertEqual(self.count("sessions", source="claude"), 0)
+        self.assertEqual(self.count("session_tools", session_source="claude"), 0)
+        self.assertEqual(self.count("session_usage", session_source="claude"), 0)
+        self.assertEqual(self.count("session_chunks", source="claude"), 0)
+        self.assertEqual(self.search_hits("cobalt-needle", "claude"), [])
+
+    def test_forget_leaves_other_sources_untouched(self):
+        self.indexer.forget_session("shared-session", "claude")
+
+        self.assertEqual(self.count("sessions", source="codex"), 1)
+        self.assertEqual(self.count("session_chunks", source="codex"), 1)
+        self.assertTrue(self.search_hits("amber-needle", "codex"))
+
+    def test_forget_without_source_matches_every_source(self):
+        counts = self.indexer.forget_session("shared-session")
+
+        self.assertEqual(counts["sessions"], 3)
+        self.assertEqual(self.count("sessions"), 0)
+
+    def test_forget_unknown_session_returns_none(self):
+        self.assertIsNone(self.indexer.forget_session("no-such-session"))
+        self.assertEqual(self.count("sessions"), 3)
+
+    @unittest.skipUnless(
+        semantic.load_vec_extension(sqlite3.connect(":memory:")),
+        "semantic extra not installed",
+    )
+    def test_forget_deletes_vectors(self):
+        semantic.load_vec_extension(self.conn)
+        self.conn.execute(
+            "CREATE VIRTUAL TABLE session_vectors USING vec0("
+            "chunk_id INTEGER PRIMARY KEY, embedding FLOAT[4])"
+        )
+        for (chunk_id,) in self.conn.execute(
+            "SELECT chunk_id FROM session_chunks"
+        ).fetchall():
+            self.conn.execute(
+                "INSERT INTO session_vectors (chunk_id, embedding) VALUES (?, ?)",
+                (chunk_id, "[0.1, 0.2, 0.3, 0.4]"),
+            )
+        self.conn.commit()
+
+        counts = self.indexer.forget_session("shared-session", "claude")
+
+        self.assertEqual(counts["session_vectors"], 1)
+        self.assertEqual(self.count("session_vectors"), 1)
+
+    def test_cli_forget_exits_nonzero_for_an_unknown_session(self):
+        self.indexer.close()
+        argv = ["sessions", "--db-path", str(self.db_path), "forget", "nope"]
+        with patch("sys.argv", argv), redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                cli.main()
+        self.assertIn("not found", str(raised.exception))
+
+    def test_cli_forget_removes_topic_files_and_prints_counts(self):
+        self.indexer.close()
+        topics_dir = Path(self.tempdir.name) / "topics"
+        topics_dir.mkdir()
+        (topics_dir / "shared-session.txt").write_text("topic")
+        state_file = Path(self.tempdir.name) / "state.json"
+        state_file.write_text(json.dumps({"shared-session": {"last_capture_at": 3}}))
+        argv = ["sessions", "--db-path", str(self.db_path), "forget",
+                "shared-session", "--source", "claude"]
+        stdout = io.StringIO()
+        with (
+            patch("sys.argv", argv),
+            patch.object(config, "get_topics_dir", return_value=topics_dir),
+            patch.object(topic_capture, "STATE_FILE", state_file),
+            redirect_stdout(stdout),
+        ):
+            cli.main()
+
+        self.assertIn("sessions: 2", stdout.getvalue())
+        self.assertFalse((topics_dir / "shared-session.txt").exists())
+        self.assertEqual(json.loads(state_file.read_text()), {})
 
 
 if __name__ == "__main__":

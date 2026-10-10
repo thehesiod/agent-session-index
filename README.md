@@ -99,6 +99,16 @@ sessions index --session <id> --source claude
 sessions index --file <path> --file <path>
 ```
 
+```bash
+# Permanently remove a session, its subagents, and everything derived from it
+sessions forget <id> --source claude
+```
+
+`forget` deletes the rows, searchable text, and vectors, plus the topic file and
+capture state the topic hook keeps. The indexer never drops a session whose
+transcript is gone, so this is how to remove one on purpose. Without `--source`
+it removes the id from every source.
+
 `--session` and `--file` both bypass the unchanged-content check, so they are the
 way to refresh rows after an extraction rule changes. `--backfill` will not: it
 skips any transcript whose hash and path still match the indexed row.

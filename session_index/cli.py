@@ -10,6 +10,7 @@ from pathlib import Path
 try:
     from . import config
     from . import semantic
+    from . import topic_capture
     from .analyzer import (
         analytics,
         format_analytics,
@@ -22,6 +23,7 @@ try:
 except ImportError:
     import config
     import semantic
+    import topic_capture
     from analyzer import (
         analytics,
         format_analytics,
@@ -35,7 +37,7 @@ except ImportError:
 SOURCES = ("claude", "codex")
 SUBCOMMANDS = {
     "context", "analytics", "synthesize", "recent", "find",
-    "tools", "topics", "stats", "index", "search", "usage", "embed",
+    "tools", "topics", "stats", "index", "search", "usage", "embed", "forget",
 }
 
 
@@ -371,6 +373,12 @@ def main():
     command.add_argument("-n", "--limit", type=int, help="Stop after N sessions")
     _add_source(command)
 
+    command = subparsers.add_parser(
+        "forget", help="Permanently remove a session and its derived data"
+    )
+    command.add_argument("session_id")
+    _add_source(command)
+
     raw_args = sys.argv[1:]
     if (
         raw_args
@@ -440,6 +448,29 @@ def main():
                 )
         finally:
             indexer.close()
+        return
+
+    if args.command == "forget":
+        try:
+            from .indexer import SessionIndexer
+        except ImportError:
+            from indexer import SessionIndexer
+        indexer = SessionIndexer(db_path=db_path)
+        indexer.connect()
+        try:
+            counts = indexer.forget_session(args.session_id, args.source)
+        except RuntimeError as exc:
+            raise SystemExit(f"Could not forget {args.session_id}: {exc}")
+        finally:
+            indexer.close()
+        if counts is None:
+            raise SystemExit(f"Session not found in the index: {args.session_id}")
+        for table, count in counts.items():
+            if count:
+                print(f"  {table}: {count}")
+        if removed := topic_capture.forget_session_files(args.session_id):
+            print(f"  {', '.join(removed)}")
+        print(f"Forgot {counts['sessions']} session(s)")
         return
 
     config.ensure_indexed(db_path)
