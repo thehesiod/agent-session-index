@@ -102,6 +102,20 @@ def save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state))
 
 
+def forget_session_files(session_id: str) -> list[str]:
+    """Remove the statusLine topic file and capture state kept for a session."""
+    removed = []
+    topic_file = config.get_topics_dir() / f"{session_id}.txt"
+    if topic_file.exists():
+        topic_file.unlink()
+        removed.append("topic file")
+    state = load_state()
+    if state.pop(session_id, None) is not None:
+        save_state(state)
+        removed.append("capture state")
+    return removed
+
+
 def find_session_file(session_id: str) -> Path | None:
     """Find session JSONL file across project dirs."""
     projects_dir = config.get_projects_dir()
